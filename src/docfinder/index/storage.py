@@ -1,0 +1,845 @@
+"""SQLite + VSS vector store."""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import sqlite3
+from contextlib import contextmanager
+from difflib import SequenceMatcher
+from functools import lru_cache
+from pathlib import Path, PurePosixPath
+from typing import Iterator, List, Sequence
+
+import numpy as np
+
+from docfinder.models import ChunkRecord, DocumentMetadata
+
+logger = logging.getLogger(__name__)
+
+_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "with",
+        "that",
+        "this",
+        "from",
+        "have",
+        "what",
+        "where",
+        "when",
+        "which",
+        "how",
+        "about",
+        "into",
+        "une",
+        "des",
+        "les",
+        "dans",
+        "pour",
+        "con",
+        "del",
+        "della",
+        "delle",
+        "degli",
+        "nel",
+        "nella",
+        "che",
+        "non",
+        "una",
+        "uno",
+        "per",
+        "come",
+        "dove",
+    }
+)
+
+_FIELD_QUERY_FILLER = frozenset(
+    {
+        "can",
+        "current",
+        "find",
+        "for",
+        "give",
+        "get",
+        "is",
+        "latest",
+        "me",
+        "my",
+        "of",
+        "please",
+        "show",
+        "tell",
+        "the",
+        "what",
+        "which",
+        "you",
+    }
+)
+_IDENTIFIER_VALUE = re.compile(r"(?=[A-Z0-9./_-]*\d)[A-Z0-9][A-Z0-9./_-]{2,}", re.IGNORECASE)
+
+
+@lru_cache(maxsize=256)
+def _query_identifier_values(query: str) -> tuple[str, ...]:
+    values = (value.strip(".,;:").casefold() for value in _IDENTIFIER_VALUE.findall(query))
+    return tuple(dict.fromkeys(value for value in values if value))
+
+
+def query_identifier_values(query: str) -> list[str]:
+    """Return exact numeric/code-like values explicitly present in a query."""
+    return list(_query_identifier_values(query))
+
+
+@lru_cache(maxsize=256)
+def identifier_field_intent(query: str) -> str | None:
+    """Extract a field label from a natural-language request for a numbered ID."""
+    words = re.findall(r"[a-z0-9]+", query.casefold())
+    suffix_index = next(
+        (
+            index
+            for index in range(len(words) - 1, -1, -1)
+            if words[index] in {"number", "no", "id", "code", "reference", "ref"}
+        ),
+        None,
+    )
+    if suffix_index is None:
+        return None
+
+    label_words = [word for word in words[:suffix_index] if word not in _FIELD_QUERY_FILLER][-4:]
+    return " ".join(label_words) if label_words else None
+
+
+@lru_cache(maxsize=256)
+def _identifier_field_pattern(label: str) -> re.Pattern[str]:
+    label_pattern = r"\s+".join(re.escape(word) for word in label.split())
+    return re.compile(
+        rf"\b{label_pattern}\b"
+        r"\s*(?:number|no\.?|#|id|code|reference|ref)?"
+        r"\s*(?:is\s+|[:=#-]\s*|\s+)"
+        r"(?P<value>[A-Z0-9][A-Z0-9./_-]{2,})",
+        re.IGNORECASE,
+    )
+
+
+def extract_field_identifier(query: str, text: str) -> str | None:
+    """Extract a numeric/code value immediately associated with the requested field label."""
+    label = identifier_field_intent(query)
+    if label is None:
+        return None
+
+    pattern = _identifier_field_pattern(label)
+    lines = text.splitlines()
+    candidates = [" ".join(lines[index : index + 2]).strip() for index in range(len(lines))] + lines
+    for candidate in candidates:
+        match = pattern.search(candidate.strip())
+        if match and _IDENTIFIER_VALUE.fullmatch(match.group("value")):
+            return match.group("value").strip(".,;:")
+    return None
+
+
+def compute_lexical_boost(query_text: str, *, text: str, title: str, path: str) -> float:
+    """Compute a small additive score boost for exact phrase, token, or filename matches.
+
+    Embeddings capture semantic similarity well, but exact invoice numbers, error
+    codes, identifiers, and filenames deserve a deterministic boost when present.
+    """
+    cleaned = (query_text or "").strip().lower()
+    if len(cleaned) < 2:
+        return 0.0
+
+    # Strip optional prefix like "code:" used for code-focused queries
+    if cleaned.startswith("code:"):
+        cleaned = cleaned[5:].strip()
+    if len(cleaned) < 2:
+        return 0.0
+
+    haystack_text = (text or "").lower()
+    haystack_title = f"{title or ''} {Path(path).name if path else ''}".lower()
+
+    boost = 0.0
+    if len(cleaned) >= 3 and cleaned in haystack_text:
+        boost += 0.12
+    if len(cleaned) >= 3 and cleaned in haystack_title:
+        boost += 0.08
+
+    tokens = [
+        tok
+        for tok in re.findall(r"[a-z0-9_.\-]+", cleaned)
+        if len(tok) >= 2 and tok not in _STOPWORDS
+    ]
+    if tokens:
+        text_hits = sum(1 for tok in tokens if tok in haystack_text)
+        title_hits = sum(1 for tok in tokens if tok in haystack_title)
+        boost += 0.10 * (text_hits / len(tokens))
+        boost += 0.06 * (title_hits / len(tokens))
+
+    identifier_values = _query_identifier_values(cleaned)
+    if identifier_values and any(
+        value.casefold() in haystack_text or value.casefold() in haystack_title
+        for value in identifier_values
+    ):
+        boost += 0.55
+
+    if extract_field_identifier(cleaned, text):
+        boost += 0.45
+
+    return min(boost, 0.85)
+
+
+class SQLiteVectorStore:
+    """Persistence layer for document and chunk embeddings."""
+
+    def __init__(self, db_path: Path, *, dimension: int) -> None:
+        self.db_path = Path(db_path)
+        self.dimension = dimension
+        self._conn = sqlite3.connect(self.db_path)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA synchronous=NORMAL;")
+        self._ensure_schema()
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        return self._conn
+
+    def close(self) -> None:
+        self._conn.close()
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        try:
+            yield self._conn
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def _ensure_schema(self) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS documents (
+                    id INTEGER PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    title TEXT,
+                    sha256 TEXT NOT NULL,
+                    mtime REAL NOT NULL,
+                    size INTEGER NOT NULL,
+                    privacy INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS documents_updated
+                AFTER UPDATE ON documents
+                BEGIN
+                    UPDATE documents SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id INTEGER PRIMARY KEY,
+                    document_id INTEGER NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    metadata TEXT,
+                    embedding BLOB NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_chunks_document_id
+                    ON chunks(document_id)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            # Clean up legacy vector tables if present
+            conn.execute("DROP TABLE IF EXISTS chunk_index")
+            conn.execute("DROP TABLE IF EXISTS chunk_index_data")
+            conn.execute("DROP TABLE IF EXISTS chunk_index_index")
+
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)")}
+            if "embedding" not in columns:
+                conn.execute("ALTER TABLE chunks ADD COLUMN embedding BLOB")
+
+            doc_columns = {row["name"] for row in conn.execute("PRAGMA table_info(documents)")}
+            if "privacy" not in doc_columns:
+                conn.execute("ALTER TABLE documents ADD COLUMN privacy INTEGER NOT NULL DEFAULT 0")
+
+    @staticmethod
+    def _normalize_path(path: str | Path) -> str:
+        """Return a separator-stable representation for stored paths."""
+        return str(path).replace("\\", "/")
+
+    def get_meta(self, key: str) -> str | None:
+        row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+
+    def ensure_embedding_model(self, model_name: str) -> bool:
+        """Record the embedding model used for this index.
+
+        Vectors produced by different models are not comparable. If the index
+        was built with a *different* model, all documents and chunks are dropped
+        so that indexing starts fresh. Returns True when a wipe happened.
+        """
+        stored = self.get_meta("embedding_model")
+        if stored == model_name:
+            return False
+
+        try:
+            identity = json.loads(model_name)
+        except json.JSONDecodeError:
+            identity = {}
+        if stored == identity.get("model_name") and identity.get("backend") in {
+            "local",
+            "torch",
+            "onnx",
+            "openvino",
+        }:
+            # Pre-identity indexes were local-only and stored just the model name.
+            self.set_meta("embedding_model", model_name)
+            return False
+
+        has_vectors = self._conn.execute("SELECT 1 FROM chunks LIMIT 1").fetchone() is not None
+        if stored is None and not has_vectors:
+            # Fresh index (or a legacy one that never held vectors): stamp it.
+            self.set_meta("embedding_model", model_name)
+            return False
+
+        # Either a known different model, or unknown provenance with existing
+        # vectors (a pre-meta database) - in both cases the index is not
+        # trustworthy for the current model.
+        logger.warning(
+            "Index was built with '%s' but the current model is '%s' - "
+            "clearing the index so everything is re-embedded",
+            stored or "an unknown model",
+            model_name,
+        )
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM chunks")
+            conn.execute("DELETE FROM documents")
+            conn.execute(
+                """
+                INSERT INTO meta(key, value) VALUES ('embedding_model', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (model_name,),
+            )
+        return True
+
+    @classmethod
+    def _normalize_folder(cls, folder: str | Path) -> str:
+        """Normalize folder filters while preserving root/drive roots."""
+        normalized = cls._normalize_path(folder)
+        while normalized.endswith("/") and normalized != "/" and not normalized.endswith(":/"):
+            normalized = normalized[:-1]
+        return normalized
+
+    def init_document(
+        self, document: DocumentMetadata, *, privacy: bool = False
+    ) -> tuple[int, str]:
+        """Initialize a document for insertion.
+
+        Returns:
+            (doc_id, status) where status is 'inserted', 'updated', or 'skipped'.
+            If skipped, doc_id is -1.
+        """
+        # Note: This should be called within a transaction
+        conn = self._conn
+
+        existing = conn.execute(
+            "SELECT id, sha256, privacy FROM documents WHERE REPLACE(path, '\\', '/') = ?",
+            (self._normalize_path(document.path),),
+        ).fetchone()
+
+        if existing and existing["sha256"] == document.sha256:
+            if privacy and not existing["privacy"]:
+                conn.execute("UPDATE documents SET privacy = 1 WHERE id = ?", (existing["id"],))
+            return -1, "skipped"
+
+        if existing:
+            conn.execute("DELETE FROM chunks WHERE document_id = ?", (existing["id"],))
+            conn.execute("DELETE FROM documents WHERE id = ?", (existing["id"],))
+
+        doc_id = conn.execute(
+            """
+            INSERT INTO documents(path, title, sha256, mtime, size, privacy)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(document.path),
+                document.title,
+                document.sha256,
+                document.mtime,
+                document.size,
+                int(privacy),
+            ),
+        ).lastrowid
+
+        return doc_id, "updated" if existing else "inserted"
+
+    def insert_chunks(
+        self, doc_id: int, chunks: Sequence[ChunkRecord], embeddings: np.ndarray
+    ) -> None:
+        """Insert a batch of chunks for a document."""
+        if embeddings.shape[0] != len(chunks):
+            raise ValueError("Embeddings and chunks length mismatch")
+
+        data = [
+            (
+                doc_id,
+                chunk.index,
+                chunk.text,
+                json.dumps(chunk.metadata, ensure_ascii=True),
+                sqlite3.Binary(np.asarray(vector, dtype="float32").tobytes()),
+            )
+            for chunk, vector in zip(chunks, embeddings)
+        ]
+        sql = (
+            "INSERT INTO chunks"
+            "(document_id, chunk_index, text, metadata, embedding)"
+            " VALUES (?, ?, ?, ?, ?)"
+        )
+        self._conn.executemany(sql, data)
+
+    def upsert_document(
+        self,
+        document: DocumentMetadata,
+        chunks: Sequence[ChunkRecord],
+        embeddings: np.ndarray,
+        *,
+        privacy: bool = False,
+    ) -> str:
+        with self.transaction():
+            doc_id, status = self.init_document(document, privacy=privacy)
+            if status == "skipped":
+                return status
+
+            self.insert_chunks(doc_id, chunks, embeddings)
+            return status
+
+    def is_document_privacy(self, document_path: str) -> bool:
+        """Return True if the document was indexed with the 100% privacy flag."""
+        row = self._conn.execute(
+            "SELECT privacy FROM documents WHERE REPLACE(path, '\\', '/') = ?",
+            (self._normalize_path(document_path),),
+        ).fetchone()
+        return bool(row and row["privacy"])
+
+    def search(
+        self,
+        embedding: np.ndarray,
+        *,
+        top_k: int = 10,
+        folders: Sequence[str] | None = None,
+        paths: Sequence[str] | None = None,
+        query_text: str | None = None,
+        multiline_query: str | None = None,
+    ) -> List[dict]:
+        query = np.asarray(embedding, dtype="float32")
+        sql = """
+            SELECT
+                c.document_id AS document_id,
+                d.path AS path,
+                d.title AS title,
+                c.chunk_index AS chunk_index,
+                c.text AS text,
+                c.metadata AS metadata,
+                c.embedding AS embedding
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            """
+        params: list[str] = []
+        where_clauses: list[str] = []
+
+        if folders is not None:
+            normalized = sorted(
+                {
+                    self._normalize_folder(f.strip())
+                    for f in folders
+                    if f and f.strip() and self._normalize_folder(f.strip())
+                }
+            )
+            if not normalized:
+                return []
+            folder_clauses = []
+            for folder in normalized:
+                folder_clauses.append(
+                    "(REPLACE(d.path, '\\', '/') = ? OR REPLACE(d.path, '\\', '/') LIKE ?)"
+                )
+                params.extend([folder, f"{folder}/%"])
+            where_clauses.append(" OR ".join(folder_clauses))
+
+        if paths is not None:
+            normalized_paths = sorted(
+                {self._normalize_path(path.strip()) for path in paths if path and path.strip()}
+            )
+            if not normalized_paths:
+                return []
+            where_clauses.append(
+                "REPLACE(d.path, '\\', '/') IN (" + ", ".join("?" for _ in normalized_paths) + ")"
+            )
+            params.extend(normalized_paths)
+
+        if where_clauses:
+            sql += " WHERE " + " AND ".join(f"({clause})" for clause in where_clauses)
+
+        rows = self._conn.execute(sql, params).fetchall()
+
+        if not rows:
+            return []
+
+        stored_dim = np.frombuffer(rows[0]["embedding"], dtype="float32").size
+        if stored_dim != query.size:
+            raise ValueError(
+                f"Index vectors have {stored_dim} dimensions but the current "
+                f"embedding model produces {query.size}. The index was built "
+                "with a different embedding model - re-index your documents."
+            )
+
+        embeddings = np.vstack([np.frombuffer(row["embedding"], dtype="float32") for row in rows])
+        scores = (embeddings @ query).astype("float64")
+
+        if query_text and query_text.strip():
+            q_str = query_text.strip()
+            boosts = np.fromiter(
+                (
+                    compute_lexical_boost(
+                        q_str,
+                        text=row["text"] or "",
+                        title=row["title"] or "",
+                        path=row["path"] or "",
+                    )
+                    for row in rows
+                ),
+                dtype="float64",
+                count=len(rows),
+            )
+            scores = scores + boosts
+
+        if multiline_query and multiline_query.strip():
+            query_lines = [
+                line.strip().casefold()[:250]
+                for line in multiline_query.splitlines()
+                if line.strip()
+            ][:20]
+            if len(query_lines) > 1:
+                candidate_count = min(len(scores), max(top_k * 10, 60))
+                candidates = np.argpartition(scores, -candidate_count)[-candidate_count:]
+                for idx in candidates:
+                    text_lines = [
+                        line.strip().casefold()[:250]
+                        for line in str(rows[idx]["text"] or "").splitlines()
+                        if line.strip()
+                    ][:100]
+                    if not text_lines:
+                        continue
+                    line_scores = [
+                        max(
+                            SequenceMatcher(None, query_line, text_line).ratio()
+                            for text_line in text_lines
+                        )
+                        for query_line in query_lines
+                    ]
+                    coverage = sum(score >= 0.5 for score in line_scores) / len(line_scores)
+                    if coverage:
+                        scores[idx] += 0.3 * coverage * (sum(line_scores) / len(line_scores))
+
+        if top_k < len(scores):
+            top_indices = np.argpartition(scores, -top_k)[-top_k:]
+            top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+        else:
+            top_indices = np.argsort(scores)[::-1]
+
+        results: List[dict] = []
+        for idx in top_indices:
+            row = rows[idx]
+            results.append(
+                {
+                    "document_id": row["document_id"],
+                    "path": row["path"],
+                    "title": row["title"],
+                    "chunk_index": row["chunk_index"],
+                    "text": row["text"],
+                    "metadata": row["metadata"],
+                    "score": float(scores[idx]),
+                }
+            )
+        return results
+
+    def list_indexed_directories(self) -> List[dict]:
+        """Return indexed parent directories and document counts."""
+        rows = self._conn.execute("SELECT path FROM documents").fetchall()
+        counts: dict[str, int] = {}
+        for row in rows:
+            normalized_path = self._normalize_path(row["path"])
+            parent = str(PurePosixPath(normalized_path).parent)
+            counts[parent] = counts.get(parent, 0) + 1
+
+        return [{"path": path, "document_count": counts[path]} for path in sorted(counts.keys())]
+
+    def get_document_chunk_count(self, document_id: int) -> int:
+        """Return the total number of chunks for a document."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE document_id = ?", (document_id,)
+        ).fetchone()
+        return row[0] if row else 0
+
+    def get_all_chunks(self, document_id: int) -> List[dict]:
+        """Return all chunks for a document, ordered by chunk_index."""
+        rows = self._conn.execute(
+            """
+            SELECT chunk_index, text, metadata
+            FROM chunks
+            WHERE document_id = ?
+            ORDER BY chunk_index
+            """,
+            (document_id,),
+        ).fetchall()
+        return [
+            {"chunk_index": row["chunk_index"], "text": row["text"], "metadata": row["metadata"]}
+            for row in rows
+        ]
+
+    def get_context_window(
+        self, document_id: int, center_index: int, window_size: int = 10
+    ) -> List[dict]:
+        """Return chunks surrounding *center_index* within the same document.
+
+        Retrieves up to *window_size* chunks before and after (inclusive of center),
+        ordered by ``chunk_index``.
+        """
+        low = max(0, center_index - window_size)
+        high = center_index + window_size
+
+        rows = self._conn.execute(
+            """
+            SELECT
+                c.chunk_index AS chunk_index,
+                c.text AS text,
+                c.metadata AS metadata
+            FROM chunks c
+            WHERE c.document_id = ? AND c.chunk_index BETWEEN ? AND ?
+            ORDER BY c.chunk_index
+            """,
+            (document_id, low, high),
+        ).fetchall()
+
+        return [
+            {
+                "chunk_index": row["chunk_index"],
+                "text": row["text"],
+                "metadata": row["metadata"],
+            }
+            for row in rows
+        ]
+
+    def get_context_by_page(
+        self, document_id: int, center_page: int, *, max_chars: int = 16000
+    ) -> List[dict]:
+        """Return chunks belonging to *center_page* and, if needed, adjacent pages.
+
+        Expands symmetrically to neighbouring pages until *max_chars* is reached
+        or no more pages are available.
+        """
+        # First get all chunks for this document with their page metadata
+        rows = self._conn.execute(
+            """
+            SELECT
+                c.chunk_index AS chunk_index,
+                c.text AS text,
+                c.metadata AS metadata
+            FROM chunks c
+            WHERE c.document_id = ?
+            ORDER BY c.chunk_index
+            """,
+            (document_id,),
+        ).fetchall()
+
+        if not rows:
+            return []
+
+        # Parse page numbers from metadata
+        chunks_with_page = []
+        for row in rows:
+            meta = json.loads(row["metadata"]) if row["metadata"] else {}
+            page = meta.get("page", 0)
+            chunks_with_page.append(
+                {
+                    "chunk_index": row["chunk_index"],
+                    "text": row["text"],
+                    "metadata": row["metadata"],
+                    "page": page,
+                }
+            )
+
+        # Collect pages: start with center_page, then expand symmetrically
+        collected: List[dict] = []
+        total_chars = 0
+
+        # Add center page first
+        for c in chunks_with_page:
+            if c["page"] == center_page:
+                collected.append(c)
+                total_chars += len(c["text"])
+
+        # Expand to adjacent pages
+        expand = 1
+        while total_chars < max_chars:
+            added = False
+            for offset_page in (center_page - expand, center_page + expand):
+                if offset_page < 0:
+                    continue
+                for c in chunks_with_page:
+                    if c["page"] == offset_page and total_chars < max_chars:
+                        collected.append(c)
+                        total_chars += len(c["text"])
+                        added = True
+            if not added:
+                break
+            expand += 1
+
+        # Sort by chunk_index for coherent reading order
+        collected.sort(key=lambda c: c["chunk_index"])
+
+        # Remove the internal 'page' key before returning
+        return [
+            {
+                "chunk_index": c["chunk_index"],
+                "text": c["text"],
+                "metadata": c["metadata"],
+            }
+            for c in collected
+        ]
+
+    def remove_missing_files(self) -> int:
+        """Remove documents whose files no longer exist."""
+        with self.transaction() as conn:
+            rows = conn.execute("SELECT id, path FROM documents").fetchall()
+            missing = [row for row in rows if not Path(row["path"]).exists()]
+            for row in missing:
+                conn.execute("DELETE FROM chunks WHERE document_id = ?", (row["id"],))
+                conn.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
+        return len(missing)
+
+    def clear_all(self) -> int:
+        """Remove all documents and chunks. Returns the number of documents removed."""
+        with self.transaction() as conn:
+            removed = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+            conn.execute("DELETE FROM chunks")
+            conn.execute("DELETE FROM documents")
+        return removed
+
+    def list_documents(self) -> List[dict]:
+        """List all indexed documents with their metadata."""
+        rows = self._conn.execute(
+            """
+            SELECT
+                d.id,
+                d.path,
+                d.title,
+                d.sha256,
+                d.mtime,
+                d.size,
+                d.privacy,
+                d.created_at,
+                d.updated_at,
+                COUNT(c.id) as chunk_count
+            FROM documents d
+            LEFT JOIN chunks c ON c.document_id = d.id
+            GROUP BY d.id
+            ORDER BY d.updated_at DESC
+            """
+        ).fetchall()
+
+        return [
+            {
+                "id": row["id"],
+                "path": row["path"],
+                "title": row["title"],
+                "sha256": row["sha256"],
+                "mtime": row["mtime"],
+                "size": row["size"],
+                "privacy": bool(row["privacy"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "chunk_count": row["chunk_count"],
+            }
+            for row in rows
+        ]
+
+    def delete_document(self, doc_id: int) -> bool:
+        """Delete a document and its chunks by ID.
+
+        Returns True if document was found and deleted, False otherwise.
+        """
+        with self.transaction() as conn:
+            existing = conn.execute("SELECT id FROM documents WHERE id = ?", (doc_id,)).fetchone()
+
+            if not existing:
+                return False
+
+            conn.execute("DELETE FROM chunks WHERE document_id = ?", (doc_id,))
+            conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+            return True
+
+    def delete_document_by_path(self, path: str) -> bool:
+        """Delete a document and its chunks by file path.
+
+        Returns True if document was found and deleted, False otherwise.
+        """
+        with self.transaction() as conn:
+            normalized_path = self._normalize_path(path)
+            existing = conn.execute(
+                "SELECT id FROM documents WHERE REPLACE(path, '\\', '/') = ?",
+                (normalized_path,),
+            ).fetchone()
+
+            if not existing:
+                return False
+
+            doc_id = existing["id"]
+            conn.execute("DELETE FROM chunks WHERE document_id = ?", (doc_id,))
+            conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
+            return True
+
+    def get_stats(self) -> dict:
+        """Get database statistics."""
+        doc_count = self._conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        chunk_count = self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        total_size = self._conn.execute("SELECT COALESCE(SUM(size), 0) FROM documents").fetchone()[
+            0
+        ]
+
+        return {
+            "document_count": doc_count,
+            "chunk_count": chunk_count,
+            "total_size_bytes": total_size,
+        }

@@ -1,0 +1,1086 @@
+"""Tests for SQLiteVectorStore."""
+
+import json
+import sqlite3
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from docfinder.index.storage import (
+    SQLiteVectorStore,
+    extract_field_identifier,
+    identifier_field_intent,
+    query_identifier_values,
+)
+from docfinder.models import ChunkRecord, DocumentMetadata
+
+
+def _normalize_path(value: str) -> str:
+    return value.replace("\\", "/")
+
+
+def test_extract_field_identifier_from_labeled_value() -> None:
+    query = "What is my application number?"
+    text = "Applicant: Example\nApplication No.: APP-2025-01234\n"
+
+    assert identifier_field_intent(query) == "application"
+    assert extract_field_identifier(query, text) == "APP-2025-01234"
+    assert (
+        extract_field_identifier(
+            query,
+            "Application Number:\nAPP-2025-01234",
+        )
+        == "APP-2025-01234"
+    )
+    assert (
+        extract_field_identifier(
+            query,
+            "Application Number is APP-2025-01234",
+        )
+        == "APP-2025-01234"
+    )
+
+
+def test_query_identifier_values_extracts_literal_id() -> None:
+    assert query_identifier_values("Find application APP-2025-01234") == ["app-2025-01234"]
+
+
+@pytest.fixture
+def temp_db(tmp_path):
+    """Create a temporary database for testing."""
+    db_path = tmp_path / "test.db"
+    store = SQLiteVectorStore(db_path, dimension=384)
+    yield store
+    store.close()
+
+
+class TestSQLiteVectorStore:
+    """Test SQLiteVectorStore initialization and schema."""
+
+    def test_init_creates_database(self, tmp_path):
+        db_path = tmp_path / "new.db"
+        assert not db_path.exists()
+
+        store = SQLiteVectorStore(db_path, dimension=384)
+
+        assert db_path.exists()
+        assert store.db_path == db_path
+        assert store.dimension == 384
+        store.close()
+
+    def test_schema_creation(self, temp_db):
+        """Test that schema is properly created."""
+        conn = temp_db.connection
+
+        # Check documents table
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='documents'"
+        )
+        assert cursor.fetchone() is not None
+
+        # Check chunks table
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chunks'")
+        assert cursor.fetchone() is not None
+
+        # Check index
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_chunks_document_id'"
+        )
+        assert cursor.fetchone() is not None
+
+    def test_pragma_settings(self, temp_db):
+        """Test that PRAGMA settings are applied."""
+        conn = temp_db.connection
+
+        # Check WAL mode
+        cursor = conn.execute("PRAGMA journal_mode")
+        result = cursor.fetchone()
+        assert result[0].lower() == "wal"
+
+        # Check synchronous mode
+        cursor = conn.execute("PRAGMA synchronous")
+        result = cursor.fetchone()
+        assert result[0] == 1  # NORMAL mode
+
+    def test_connection_property(self, temp_db):
+        """Test connection property returns sqlite3.Connection."""
+        assert isinstance(temp_db.connection, sqlite3.Connection)
+
+    def test_close(self, tmp_path):
+        """Test closing the database connection."""
+        db_path = tmp_path / "close_test.db"
+        store = SQLiteVectorStore(db_path, dimension=384)
+        conn = store.connection
+
+        store.close()
+
+        # After closing, operations should fail
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+class TestTransaction:
+    """Test transaction context manager."""
+
+    def test_commit_on_success(self, temp_db):
+        """Test that transaction commits on success."""
+        with temp_db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO documents(path, title, sha256, mtime, size) VALUES (?, ?, ?, ?, ?)",
+                ("/tmp/test.pdf", "Test", "abc123", 1234567890.0, 1000),
+            )
+
+        # Verify commit
+        cursor = temp_db.connection.execute("SELECT COUNT(*) FROM documents")
+        assert cursor.fetchone()[0] == 1
+
+    def test_rollback_on_exception(self, temp_db):
+        """Test that transaction rolls back on exception."""
+        try:
+            with temp_db.transaction() as conn:
+                conn.execute(
+                    "INSERT INTO documents(path, title, sha256, mtime, size) VALUES (?, ?, ?, ?, ?)",
+                    ("/tmp/test.pdf", "Test", "abc123", 1234567890.0, 1000),
+                )
+                raise ValueError("Test error")
+        except ValueError:
+            pass
+
+        # Verify rollback
+        cursor = temp_db.connection.execute("SELECT COUNT(*) FROM documents")
+        assert cursor.fetchone()[0] == 0
+
+
+class TestUpsertDocument:
+    """Test document and chunks insertion/update."""
+
+    def test_insert_new_document(self, temp_db):
+        """Test inserting a new document."""
+        doc = DocumentMetadata(
+            path=Path("/tmp/test.pdf"),
+            title="Test Document",
+            sha256="abc123",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        chunks = [
+            ChunkRecord(document_path=doc.path, index=0, text="First chunk", metadata={"page": 1}),
+            ChunkRecord(document_path=doc.path, index=1, text="Second chunk", metadata={"page": 2}),
+        ]
+        embeddings = np.random.rand(2, 384).astype("float32")
+
+        status = temp_db.upsert_document(doc, chunks, embeddings)
+
+        assert status == "inserted"
+
+        # Verify document
+        cursor = temp_db.connection.execute(
+            "SELECT * FROM documents WHERE path = ?", (str(doc.path),)
+        )
+        row = cursor.fetchone()
+        assert row is not None
+        assert row["title"] == "Test Document"
+        assert row["sha256"] == "abc123"
+
+        # Verify chunks
+        cursor = temp_db.connection.execute(
+            "SELECT COUNT(*) FROM chunks WHERE document_id = ?", (row["id"],)
+        )
+        assert cursor.fetchone()[0] == 2
+
+    def test_skip_unchanged_document(self, temp_db):
+        """Test that unchanged documents are skipped."""
+        doc = DocumentMetadata(
+            path=Path("/tmp/test.pdf"), title="Test", sha256="abc123", mtime=1234567890.0, size=1000
+        )
+        chunks = [ChunkRecord(document_path=doc.path, index=0, text="Chunk", metadata={})]
+        embeddings = np.random.rand(1, 384).astype("float32")
+
+        # First insert
+        status1 = temp_db.upsert_document(doc, chunks, embeddings)
+        assert status1 == "inserted"
+
+        # Second insert with same sha256
+        status2 = temp_db.upsert_document(doc, chunks, embeddings)
+        assert status2 == "skipped"
+
+        # Verify only one document
+        cursor = temp_db.connection.execute("SELECT COUNT(*) FROM documents")
+        assert cursor.fetchone()[0] == 1
+
+    def test_update_modified_document(self, temp_db):
+        """Test updating a document with different sha256."""
+        doc1 = DocumentMetadata(
+            path=Path("/tmp/test.pdf"),
+            title="Test",
+            sha256="old_hash",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        chunks1 = [ChunkRecord(document_path=doc1.path, index=0, text="Old chunk", metadata={})]
+        embeddings1 = np.random.rand(1, 384).astype("float32")
+
+        # First insert
+        status1 = temp_db.upsert_document(doc1, chunks1, embeddings1)
+        assert status1 == "inserted"
+
+        # Update with new sha256
+        doc2 = DocumentMetadata(
+            path=Path("/tmp/test.pdf"),
+            title="Test Updated",
+            sha256="new_hash",
+            mtime=1234567891.0,
+            size=1100,
+        )
+        chunks2 = [
+            ChunkRecord(document_path=doc2.path, index=0, text="New chunk 1", metadata={}),
+            ChunkRecord(document_path=doc2.path, index=1, text="New chunk 2", metadata={}),
+        ]
+        embeddings2 = np.random.rand(2, 384).astype("float32")
+
+        status2 = temp_db.upsert_document(doc2, chunks2, embeddings2)
+        assert status2 == "updated"
+
+        # Verify document updated
+        cursor = temp_db.connection.execute(
+            "SELECT * FROM documents WHERE path = ?", (str(doc2.path),)
+        )
+        row = cursor.fetchone()
+        assert row["sha256"] == "new_hash"
+        assert row["title"] == "Test Updated"
+
+        # Verify chunks replaced
+        cursor = temp_db.connection.execute(
+            "SELECT COUNT(*) FROM chunks WHERE document_id = ?", (row["id"],)
+        )
+        assert cursor.fetchone()[0] == 2
+
+    def test_upsert_validation(self, temp_db):
+        """Test validation of embeddings and chunks length."""
+        doc = DocumentMetadata(
+            path=Path("/tmp/test.pdf"), title="Test", sha256="abc123", mtime=1234567890.0, size=1000
+        )
+        chunks = [ChunkRecord(document_path=doc.path, index=0, text="Chunk", metadata={})]
+        embeddings = np.random.rand(2, 384).astype("float32")  # Wrong size!
+
+        with pytest.raises(ValueError, match="Embeddings and chunks length mismatch"):
+            temp_db.upsert_document(doc, chunks, embeddings)
+
+    def test_chunks_metadata_serialization(self, temp_db):
+        """Test that chunk metadata is properly serialized to JSON."""
+        doc = DocumentMetadata(
+            path=Path("/tmp/test.pdf"), title="Test", sha256="abc123", mtime=1234567890.0, size=1000
+        )
+        chunks = [
+            ChunkRecord(
+                document_path=doc.path,
+                index=0,
+                text="Chunk",
+                metadata={"page": 5, "section": "intro"},
+            )
+        ]
+        embeddings = np.random.rand(1, 384).astype("float32")
+
+        temp_db.upsert_document(doc, chunks, embeddings)
+
+        cursor = temp_db.connection.execute("SELECT metadata FROM chunks")
+        row = cursor.fetchone()
+        metadata = json.loads(row["metadata"])
+        assert metadata == {"page": 5, "section": "intro"}
+
+
+class TestEnsureEmbeddingModel:
+    """Test embedding-model tracking and wipe on model change."""
+
+    def _insert_doc(self, store):
+        doc = DocumentMetadata(
+            path=Path("/tmp/test.pdf"), title="Test", sha256="abc123", mtime=1234567890.0, size=1000
+        )
+        chunks = [ChunkRecord(document_path=doc.path, index=0, text="Chunk", metadata={})]
+        embeddings = np.ones((1, 384), dtype="float32")
+        store.upsert_document(doc, chunks, embeddings)
+
+    def test_fresh_index_sets_model_without_wipe(self, temp_db):
+        assert temp_db.ensure_embedding_model("model-a") is False
+        assert temp_db.get_meta("embedding_model") == "model-a"
+
+    def test_legacy_index_without_meta_is_wiped(self, temp_db):
+        """A pre-meta database with vectors has unknown provenance: wipe it."""
+        self._insert_doc(temp_db)
+
+        assert temp_db.ensure_embedding_model("model-a") is True
+
+        stats = temp_db.get_stats()
+        assert stats["document_count"] == 0
+        assert stats["chunk_count"] == 0
+        assert temp_db.get_meta("embedding_model") == "model-a"
+
+    def test_same_model_keeps_documents(self, temp_db):
+        temp_db.ensure_embedding_model("model-a")
+        self._insert_doc(temp_db)
+
+        assert temp_db.ensure_embedding_model("model-a") is False
+        assert temp_db.get_stats()["document_count"] == 1
+
+    def test_legacy_local_model_identity_is_migrated_without_wipe(self, temp_db):
+        temp_db.ensure_embedding_model("model-a")
+        self._insert_doc(temp_db)
+        identity = '{"backend":"torch","model_name":"model-a"}'
+
+        assert temp_db.ensure_embedding_model(identity) is False
+        assert temp_db.get_stats()["document_count"] == 1
+        assert temp_db.get_meta("embedding_model") == identity
+
+    def test_model_change_wipes_index(self, temp_db):
+        temp_db.ensure_embedding_model("old-model")
+        self._insert_doc(temp_db)
+
+        assert temp_db.ensure_embedding_model("new-model") is True
+
+        stats = temp_db.get_stats()
+        assert stats["document_count"] == 0
+        assert stats["chunk_count"] == 0
+        assert temp_db.get_meta("embedding_model") == "new-model"
+
+    def test_search_dimension_mismatch_raises(self, temp_db):
+        self._insert_doc(temp_db)  # stores 384-dim vectors
+
+        with pytest.raises(ValueError, match="different embedding model"):
+            temp_db.search(np.ones(768, dtype="float32"))
+
+
+class TestSearch:
+    """Test vector search."""
+
+    def test_search_empty_database(self, temp_db):
+        """Test search on empty database."""
+        query = np.random.rand(384).astype("float32")
+
+        results = temp_db.search(query, top_k=5)
+
+        assert results == []
+
+    def test_search_returns_top_k(self, temp_db):
+        """Test that search returns top_k results."""
+        # Insert 10 documents
+        for i in range(10):
+            doc = DocumentMetadata(
+                path=Path(f"/tmp/doc{i}.pdf"),
+                title=f"Doc {i}",
+                sha256=f"hash{i}",
+                mtime=1234567890.0,
+                size=1000,
+            )
+            chunks = [ChunkRecord(document_path=doc.path, index=0, text=f"Text {i}", metadata={})]
+            embeddings = np.random.rand(1, 384).astype("float32")
+            temp_db.upsert_document(doc, chunks, embeddings)
+
+        query = np.random.rand(384).astype("float32")
+        results = temp_db.search(query, top_k=5)
+
+        assert len(results) == 5
+
+    def test_search_returns_all_when_top_k_larger(self, temp_db):
+        """Test that search returns all results when top_k > num_chunks."""
+        # Insert 3 documents
+        for i in range(3):
+            doc = DocumentMetadata(
+                path=Path(f"/tmp/doc{i}.pdf"),
+                title=f"Doc {i}",
+                sha256=f"hash{i}",
+                mtime=1234567890.0,
+                size=1000,
+            )
+            chunks = [ChunkRecord(document_path=doc.path, index=0, text=f"Text {i}", metadata={})]
+            embeddings = np.random.rand(1, 384).astype("float32")
+            temp_db.upsert_document(doc, chunks, embeddings)
+
+        query = np.random.rand(384).astype("float32")
+        results = temp_db.search(query, top_k=10)
+
+        assert len(results) == 3
+
+    def test_search_result_structure(self, temp_db):
+        """Test structure of search results."""
+        doc = DocumentMetadata(
+            path=Path("/tmp/test.pdf"),
+            title="Test Doc",
+            sha256="abc123",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        chunks = [
+            ChunkRecord(document_path=doc.path, index=0, text="Sample text", metadata={"page": 1})
+        ]
+        embeddings = np.random.rand(1, 384).astype("float32")
+        temp_db.upsert_document(doc, chunks, embeddings)
+
+        query = np.random.rand(384).astype("float32")
+        results = temp_db.search(query, top_k=1)
+
+        assert len(results) == 1
+        result = results[0]
+        assert "path" in result
+        assert "title" in result
+        assert "chunk_index" in result
+        assert "text" in result
+        assert "metadata" in result
+        assert "score" in result
+        assert result["path"] == str(doc.path)
+        assert result["title"] == "Test Doc"
+        assert result["text"] == "Sample text"
+
+    def test_search_exact_word_lexical_boost_reorders_ties(self, temp_db):
+        """Exact invoice/identifier match boosts score over identical vector similarity."""
+        same_vec = np.ones((1, 384), dtype="float32") / np.sqrt(384)
+        for idx, (name, text) in enumerate(
+            [
+                ("generic.pdf", "General payment terms and conditions."),
+                ("invoice_2026.pdf", "Payment reference code INV-2026-9941 due in 30 days."),
+            ]
+        ):
+            doc = DocumentMetadata(
+                path=Path(f"/tmp/{name}"),
+                title=name,
+                sha256=f"h{idx}",
+                mtime=1234567890.0,
+                size=500,
+            )
+            chunks = [ChunkRecord(document_path=doc.path, index=0, text=text, metadata={"page": 1})]
+            temp_db.upsert_document(doc, chunks, same_vec)
+
+        query_vec = same_vec[0]
+        results = temp_db.search(query_vec, top_k=2, query_text="INV-2026-9941")
+
+        assert len(results) == 2
+        assert results[0]["path"].endswith("invoice_2026.pdf")
+        assert results[0]["score"] > results[1]["score"]
+
+    def test_search_scores_descending(self, temp_db):
+        """Test that search results are sorted by score descending."""
+        # Insert multiple documents
+        for i in range(5):
+            doc = DocumentMetadata(
+                path=Path(f"/tmp/doc{i}.pdf"),
+                title=f"Doc {i}",
+                sha256=f"hash{i}",
+                mtime=1234567890.0,
+                size=1000,
+            )
+            chunks = [ChunkRecord(document_path=doc.path, index=0, text=f"Text {i}", metadata={})]
+            embeddings = np.random.rand(1, 384).astype("float32")
+            temp_db.upsert_document(doc, chunks, embeddings)
+
+        query = np.random.rand(384).astype("float32")
+        results = temp_db.search(query, top_k=5)
+
+        # Verify scores are descending
+        scores = [r["score"] for r in results]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_search_with_folder_filters(self, temp_db):
+        """Search should return only results from selected folders."""
+        doc_a = DocumentMetadata(
+            path=Path("/tmp/folder_a/doc1.pdf"),
+            title="A1",
+            sha256="hash_a1",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        doc_b = DocumentMetadata(
+            path=Path("/tmp/folder_b/doc2.pdf"),
+            title="B1",
+            sha256="hash_b1",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        chunk_a = [ChunkRecord(document_path=doc_a.path, index=0, text="Text A", metadata={})]
+        chunk_b = [ChunkRecord(document_path=doc_b.path, index=0, text="Text B", metadata={})]
+        emb_a = np.random.rand(1, 384).astype("float32")
+        emb_b = np.random.rand(1, 384).astype("float32")
+        temp_db.upsert_document(doc_a, chunk_a, emb_a)
+        temp_db.upsert_document(doc_b, chunk_b, emb_b)
+
+        query = np.random.rand(384).astype("float32")
+        results = temp_db.search(query, top_k=10, folders=["/tmp/folder_a"])
+
+        assert len(results) == 1
+        assert _normalize_path(results[0]["path"]) == "/tmp/folder_a/doc1.pdf"
+
+    def test_search_with_path_scope(self, temp_db):
+        """A search scope is restricted to the explicitly selected result files."""
+        for path in ("/tmp/doc_a.pdf", "/tmp/doc_b.pdf"):
+            doc = DocumentMetadata(
+                path=Path(path),
+                title=Path(path).name,
+                sha256=path,
+                mtime=1234567890.0,
+                size=100,
+            )
+            chunks = [ChunkRecord(document_path=doc.path, index=0, text="content", metadata={})]
+            temp_db.upsert_document(doc, chunks, np.ones((1, 384), dtype="float32") / np.sqrt(384))
+
+        results = temp_db.search(
+            np.ones(384, dtype="float32") / np.sqrt(384),
+            top_k=10,
+            paths=["/tmp/doc_b.pdf"],
+        )
+
+        assert [result["path"] for result in results] == ["/tmp/doc_b.pdf"]
+
+    def test_multiline_search_boosts_matching_lines(self, temp_db):
+        """Matching multiline text receives a deterministic ranking boost."""
+        texts = {
+            "/tmp/match.txt": "alpha information\nbeta details\n",
+            "/tmp/other.txt": "alpha information\nunrelated notes\n",
+        }
+        embedding = np.ones((1, 384), dtype="float32") / np.sqrt(384)
+        for path, text in texts.items():
+            doc = DocumentMetadata(
+                path=Path(path),
+                title=Path(path).name,
+                sha256=path,
+                mtime=1234567890.0,
+                size=100,
+            )
+            chunks = [ChunkRecord(document_path=doc.path, index=0, text=text, metadata={})]
+            temp_db.upsert_document(doc, chunks, embedding)
+
+        results = temp_db.search(
+            embedding[0],
+            top_k=2,
+            multiline_query="alpha information\nbeta details",
+        )
+
+        assert results[0]["path"] == "/tmp/match.txt"
+
+
+class TestIndexedDirectories:
+    """Test indexed directory listing for search filters."""
+
+    def test_list_indexed_directories(self, temp_db):
+        doc1 = DocumentMetadata(
+            path=Path("/tmp/alpha/doc1.pdf"),
+            title="Doc 1",
+            sha256="h1",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        doc2 = DocumentMetadata(
+            path=Path("/tmp/alpha/doc2.pdf"),
+            title="Doc 2",
+            sha256="h2",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        doc3 = DocumentMetadata(
+            path=Path("/tmp/beta/doc3.pdf"),
+            title="Doc 3",
+            sha256="h3",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        emb = np.random.rand(1, 384).astype("float32")
+        temp_db.upsert_document(
+            doc1,
+            [ChunkRecord(document_path=doc1.path, index=0, text="a", metadata={})],
+            emb,
+        )
+        temp_db.upsert_document(
+            doc2,
+            [ChunkRecord(document_path=doc2.path, index=0, text="b", metadata={})],
+            emb,
+        )
+        temp_db.upsert_document(
+            doc3,
+            [ChunkRecord(document_path=doc3.path, index=0, text="c", metadata={})],
+            emb,
+        )
+
+        directories = temp_db.list_indexed_directories()
+        assert directories == [
+            {"path": "/tmp/alpha", "document_count": 2},
+            {"path": "/tmp/beta", "document_count": 1},
+        ]
+
+
+class TestRemoveMissingFiles:
+    """Test removing documents with missing files."""
+
+    def test_remove_missing_files_empty_db(self, temp_db):
+        """Test on empty database."""
+        removed = temp_db.remove_missing_files()
+        assert removed == 0
+
+    def test_remove_missing_files(self, temp_db, tmp_path):
+        """Test removing documents whose files don't exist."""
+        # Create a real file
+        real_file = tmp_path / "real.pdf"
+        real_file.write_text("test")
+
+        # Insert documents with real and fake paths
+        doc_real = DocumentMetadata(
+            path=real_file, title="Real", sha256="real_hash", mtime=1234567890.0, size=1000
+        )
+        doc_fake = DocumentMetadata(
+            path=Path("/nonexistent/fake.pdf"),
+            title="Fake",
+            sha256="fake_hash",
+            mtime=1234567890.0,
+            size=1000,
+        )
+
+        chunks_real = [ChunkRecord(document_path=doc_real.path, index=0, text="Text", metadata={})]
+        chunks_fake = [ChunkRecord(document_path=doc_fake.path, index=0, text="Text", metadata={})]
+        embeddings = np.random.rand(1, 384).astype("float32")
+
+        temp_db.upsert_document(doc_real, chunks_real, embeddings)
+        temp_db.upsert_document(doc_fake, chunks_fake, embeddings)
+
+        # Verify 2 documents
+        cursor = temp_db.connection.execute("SELECT COUNT(*) FROM documents")
+        assert cursor.fetchone()[0] == 2
+
+        # Remove missing
+        removed = temp_db.remove_missing_files()
+
+        assert removed == 1
+
+        # Verify only real document remains
+        cursor = temp_db.connection.execute("SELECT COUNT(*) FROM documents")
+        assert cursor.fetchone()[0] == 1
+
+        cursor = temp_db.connection.execute("SELECT path FROM documents")
+        assert cursor.fetchone()["path"] == str(real_file)
+
+    def test_remove_missing_cascades_chunks(self, temp_db):
+        """Test that removing documents also removes chunks."""
+        doc = DocumentMetadata(
+            path=Path("/nonexistent/test.pdf"),
+            title="Test",
+            sha256="abc123",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        chunks = [
+            ChunkRecord(document_path=doc.path, index=0, text="Chunk 1", metadata={}),
+            ChunkRecord(document_path=doc.path, index=1, text="Chunk 2", metadata={}),
+        ]
+        embeddings = np.random.rand(2, 384).astype("float32")
+
+        temp_db.upsert_document(doc, chunks, embeddings)
+
+        # Verify 2 chunks
+        cursor = temp_db.connection.execute("SELECT COUNT(*) FROM chunks")
+        assert cursor.fetchone()[0] == 2
+
+        # Remove missing
+        temp_db.remove_missing_files()
+
+        # Verify chunks removed
+        cursor = temp_db.connection.execute("SELECT COUNT(*) FROM chunks")
+        assert cursor.fetchone()[0] == 0
+
+
+class TestListDocuments:
+    """Test list_documents method."""
+
+    def test_list_empty(self, temp_db):
+        """Test listing when no documents exist."""
+        docs = temp_db.list_documents()
+        assert docs == []
+
+    def test_list_single_document(self, temp_db):
+        """Test listing a single document."""
+        doc = DocumentMetadata(
+            path=Path("/tmp/test.pdf"),
+            title="Test Document",
+            sha256="abc123",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        chunks = [
+            ChunkRecord(document_path=doc.path, index=0, text="Chunk", metadata={}),
+        ]
+        embeddings = np.random.rand(1, 384).astype("float32")
+        temp_db.upsert_document(doc, chunks, embeddings)
+
+        docs = temp_db.list_documents()
+
+        assert len(docs) == 1
+        assert docs[0]["path"] == str(doc.path)
+        assert docs[0]["title"] == "Test Document"
+        assert docs[0]["chunk_count"] == 1
+
+    def test_list_multiple_documents(self, temp_db):
+        """Test listing multiple documents."""
+        for i in range(3):
+            doc = DocumentMetadata(
+                path=Path(f"/tmp/test{i}.pdf"),
+                title=f"Doc {i}",
+                sha256=f"hash{i}",
+                mtime=1234567890.0 + i,
+                size=1000 + i * 100,
+            )
+            chunks = [
+                ChunkRecord(document_path=doc.path, index=0, text="Chunk", metadata={}),
+            ]
+            embeddings = np.random.rand(1, 384).astype("float32")
+            temp_db.upsert_document(doc, chunks, embeddings)
+
+        docs = temp_db.list_documents()
+
+        assert len(docs) == 3
+
+
+class TestDeleteDocument:
+    """Test delete_document and delete_document_by_path methods."""
+
+    def test_delete_by_id(self, temp_db):
+        """Test deleting a document by ID."""
+        doc = DocumentMetadata(
+            path=Path("/tmp/test.pdf"),
+            title="Test",
+            sha256="abc123",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        chunks = [
+            ChunkRecord(document_path=doc.path, index=0, text="Chunk", metadata={}),
+        ]
+        embeddings = np.random.rand(1, 384).astype("float32")
+        temp_db.upsert_document(doc, chunks, embeddings)
+
+        # Get the document ID
+        docs = temp_db.list_documents()
+        doc_id = docs[0]["id"]
+
+        # Delete
+        result = temp_db.delete_document(doc_id)
+
+        assert result is True
+        assert temp_db.list_documents() == []
+
+    def test_delete_nonexistent_id(self, temp_db):
+        """Test deleting a document with nonexistent ID."""
+        result = temp_db.delete_document(9999)
+        assert result is False
+
+    def test_delete_by_path(self, temp_db):
+        """Test deleting a document by path."""
+        doc = DocumentMetadata(
+            path=Path("/tmp/test.pdf"),
+            title="Test",
+            sha256="abc123",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        chunks = [
+            ChunkRecord(document_path=doc.path, index=0, text="Chunk", metadata={}),
+        ]
+        embeddings = np.random.rand(1, 384).astype("float32")
+        temp_db.upsert_document(doc, chunks, embeddings)
+
+        # Delete by path
+        result = temp_db.delete_document_by_path(str(doc.path))
+
+        assert result is True
+        assert temp_db.list_documents() == []
+
+    def test_delete_by_path_nonexistent(self, temp_db):
+        """Test deleting a document with nonexistent path."""
+        result = temp_db.delete_document_by_path("/nonexistent/path.pdf")
+        assert result is False
+
+    def test_delete_removes_chunks(self, temp_db):
+        """Test that deleting document also removes its chunks."""
+        doc = DocumentMetadata(
+            path=Path("/tmp/test.pdf"),
+            title="Test",
+            sha256="abc123",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        chunks = [
+            ChunkRecord(document_path=doc.path, index=0, text="Chunk 1", metadata={}),
+            ChunkRecord(document_path=doc.path, index=1, text="Chunk 2", metadata={}),
+        ]
+        embeddings = np.random.rand(2, 384).astype("float32")
+        temp_db.upsert_document(doc, chunks, embeddings)
+
+        # Verify chunks exist
+        cursor = temp_db.connection.execute("SELECT COUNT(*) FROM chunks")
+        assert cursor.fetchone()[0] == 2
+
+        # Get doc ID and delete
+        docs = temp_db.list_documents()
+        temp_db.delete_document(docs[0]["id"])
+
+        # Verify chunks removed
+        cursor = temp_db.connection.execute("SELECT COUNT(*) FROM chunks")
+        assert cursor.fetchone()[0] == 0
+
+
+class TestGetDocumentChunkCount:
+    """Test get_document_chunk_count method."""
+
+    def test_zero_chunks(self, temp_db):
+        """Document with no chunks returns 0."""
+        # Insert a document directly (no chunks)
+        temp_db.connection.execute(
+            "INSERT INTO documents(path, title, sha256, mtime, size) VALUES (?, ?, ?, ?, ?)",
+            ("/tmp/empty.pdf", "Empty", "hash_empty", 1234567890.0, 100),
+        )
+        temp_db.connection.commit()
+        doc_id = temp_db.connection.execute(
+            "SELECT id FROM documents WHERE path = ?", ("/tmp/empty.pdf",)
+        ).fetchone()["id"]
+
+        assert temp_db.get_document_chunk_count(doc_id) == 0
+
+    def test_with_chunks(self, temp_db):
+        """Document with N chunks returns N."""
+        doc = DocumentMetadata(
+            path=Path("/tmp/counted.pdf"),
+            title="Counted",
+            sha256="hash_counted",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        n = 7
+        chunks = [
+            ChunkRecord(document_path=doc.path, index=i, text=f"Chunk {i}", metadata={})
+            for i in range(n)
+        ]
+        embeddings = np.random.rand(n, 384).astype("float32")
+        temp_db.upsert_document(doc, chunks, embeddings)
+
+        doc_id = temp_db.connection.execute(
+            "SELECT id FROM documents WHERE path = ?", (str(doc.path),)
+        ).fetchone()["id"]
+
+        assert temp_db.get_document_chunk_count(doc_id) == n
+
+    def test_nonexistent_document(self, temp_db):
+        """Nonexistent document_id returns 0."""
+        assert temp_db.get_document_chunk_count(9999) == 0
+
+
+class TestGetAllChunks:
+    """Test get_all_chunks method."""
+
+    def test_empty_document(self, temp_db):
+        """Document with no chunks returns empty list."""
+        temp_db.connection.execute(
+            "INSERT INTO documents(path, title, sha256, mtime, size) VALUES (?, ?, ?, ?, ?)",
+            ("/tmp/empty.pdf", "Empty", "hash_empty", 1234567890.0, 100),
+        )
+        temp_db.connection.commit()
+        doc_id = temp_db.connection.execute(
+            "SELECT id FROM documents WHERE path = ?", ("/tmp/empty.pdf",)
+        ).fetchone()["id"]
+
+        assert temp_db.get_all_chunks(doc_id) == []
+
+    def test_returns_all_chunks_ordered(self, temp_db):
+        """All chunks returned in ascending chunk_index order."""
+        doc = DocumentMetadata(
+            path=Path("/tmp/ordered.pdf"),
+            title="Ordered",
+            sha256="hash_ordered",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        n = 5
+        chunks = [
+            ChunkRecord(
+                document_path=doc.path,
+                index=i,
+                text=f"Chunk {i}",
+                metadata={"page": i + 1},
+            )
+            for i in range(n)
+        ]
+        embeddings = np.random.rand(n, 384).astype("float32")
+        temp_db.upsert_document(doc, chunks, embeddings)
+
+        doc_id = temp_db.connection.execute(
+            "SELECT id FROM documents WHERE path = ?", (str(doc.path),)
+        ).fetchone()["id"]
+
+        result = temp_db.get_all_chunks(doc_id)
+
+        assert len(result) == n
+        indices = [c["chunk_index"] for c in result]
+        assert indices == list(range(n))
+        assert "Chunk 0" in result[0]["text"]
+        assert "Chunk 4" in result[4]["text"]
+
+    def test_nonexistent_document(self, temp_db):
+        """Nonexistent document_id returns empty list."""
+        assert temp_db.get_all_chunks(9999) == []
+
+
+class TestGetStats:
+    """Test get_stats method."""
+
+    def test_stats_empty(self, temp_db):
+        """Test stats for empty database."""
+        stats = temp_db.get_stats()
+
+        assert stats["document_count"] == 0
+        assert stats["chunk_count"] == 0
+        assert stats["total_size_bytes"] == 0
+
+    def test_stats_with_documents(self, temp_db):
+        """Test stats with documents."""
+        for i in range(3):
+            doc = DocumentMetadata(
+                path=Path(f"/tmp/test{i}.pdf"),
+                title=f"Doc {i}",
+                sha256=f"hash{i}",
+                mtime=1234567890.0,
+                size=1000 + i * 100,  # 1000, 1100, 1200
+            )
+            chunks = [
+                ChunkRecord(document_path=doc.path, index=0, text="Chunk 1", metadata={}),
+                ChunkRecord(document_path=doc.path, index=1, text="Chunk 2", metadata={}),
+            ]
+            embeddings = np.random.rand(2, 384).astype("float32")
+            temp_db.upsert_document(doc, chunks, embeddings)
+
+        stats = temp_db.get_stats()
+
+        assert stats["document_count"] == 3
+        assert stats["chunk_count"] == 6  # 2 chunks per document
+        assert stats["total_size_bytes"] == 3300  # 1000 + 1100 + 1200
+
+
+class TestMeta:
+    """Test meta key-value storage."""
+
+    def test_set_and_get(self, temp_db):
+        assert temp_db.get_meta("embedding_model") is None
+        temp_db.set_meta("embedding_model", "all-mpnet-base-v2")
+        assert temp_db.get_meta("embedding_model") == "all-mpnet-base-v2"
+
+    def test_set_overwrites(self, temp_db):
+        temp_db.set_meta("embedding_model", "a")
+        temp_db.set_meta("embedding_model", "b")
+        assert temp_db.get_meta("embedding_model") == "b"
+
+    def test_survives_reopen(self, temp_db, tmp_path):
+        temp_db.set_meta("source_paths", '["/tmp/x"]')
+        temp_db.close()
+        reopened = SQLiteVectorStore(tmp_path / "test.db", dimension=384)
+        try:
+            assert reopened.get_meta("source_paths") == '["/tmp/x"]'
+        finally:
+            reopened.close()
+
+
+class TestClearAll:
+    def test_clears_documents_and_chunks(self, temp_db):
+        doc = DocumentMetadata(
+            path=Path("/tmp/test.pdf"),
+            title="Test",
+            sha256="abc",
+            mtime=1234567890.0,
+            size=1000,
+        )
+        chunks = [ChunkRecord(document_path=doc.path, index=0, text="t", metadata={})]
+        temp_db.upsert_document(doc, chunks, np.random.rand(1, 384).astype("float32"))
+
+        removed = temp_db.clear_all()
+
+        assert removed == 1
+        stats = temp_db.get_stats()
+        assert stats["document_count"] == 0
+        assert stats["chunk_count"] == 0
+
+    def test_clear_all_empty(self, temp_db):
+        assert temp_db.clear_all() == 0
+
+
+class TestPrivacyFlag:
+    """Test the per-document 100% privacy flag."""
+
+    def _doc(self, path: Path) -> DocumentMetadata:
+        return DocumentMetadata(path=path, title="T", sha256="abc", mtime=1234567890.0, size=1000)
+
+    def test_default_privacy_false(self, temp_db):
+        temp_db.upsert_document(
+            self._doc(Path("/tmp/a.pdf")),
+            [ChunkRecord(document_path=Path("/tmp/a.pdf"), index=0, text="t", metadata={})],
+            np.random.rand(1, 384).astype("float32"),
+        )
+        assert temp_db.is_document_privacy("/tmp/a.pdf") is False
+
+    def test_privacy_roundtrip(self, temp_db):
+        doc = self._doc(Path("/tmp/private.pdf"))
+        temp_db.upsert_document(
+            doc,
+            [ChunkRecord(document_path=doc.path, index=0, text="t", metadata={})],
+            np.random.rand(1, 384).astype("float32"),
+            privacy=True,
+        )
+        assert temp_db.is_document_privacy("/tmp/private.pdf") is True
+
+    def test_unchanged_document_can_be_marked_private(self, temp_db):
+        doc = self._doc(Path("/tmp/private.pdf"))
+        chunks = [ChunkRecord(document_path=doc.path, index=0, text="t", metadata={})]
+        temp_db.upsert_document(doc, chunks, np.random.rand(1, 384).astype("float32"))
+
+        assert (
+            temp_db.upsert_document(
+                doc, chunks, np.random.rand(1, 384).astype("float32"), privacy=True
+            )
+            == "skipped"
+        )
+        assert temp_db.is_document_privacy("/tmp/private.pdf") is True
+
+    def test_list_documents_exposes_privacy(self, temp_db):
+        doc = self._doc(Path("/tmp/private.pdf"))
+        temp_db.upsert_document(
+            doc,
+            [ChunkRecord(document_path=doc.path, index=0, text="t", metadata={})],
+            np.random.rand(1, 384).astype("float32"),
+            privacy=True,
+        )
+        assert temp_db.list_documents()[0]["privacy"] is True
+
+    def test_missing_document_is_not_privacy(self, temp_db):
+        assert temp_db.is_document_privacy("/tmp/never-indexed.pdf") is False
+
+    def test_old_db_without_privacy_column_migrates(self, tmp_path):
+        """A pre-privacy database gains the column with default 0 on reopen."""
+        db_path = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE documents (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                title TEXT,
+                sha256 TEXT NOT NULL,
+                mtime REAL NOT NULL,
+                size INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO documents(path, title, sha256, mtime, size) VALUES (?, ?, ?, ?, ?)",
+            ("/tmp/old.pdf", "Old", "sha", 1.0, 10),
+        )
+        conn.commit()
+        conn.close()
+
+        store = SQLiteVectorStore(db_path, dimension=384)
+        try:
+            assert store.is_document_privacy("/tmp/old.pdf") is False
+            assert store.list_documents()[0]["privacy"] is False
+        finally:
+            store.close()

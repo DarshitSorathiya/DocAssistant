@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DocFinder Search</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", system-ui, sans-serif;
+      font-size: 14px;
+      background: #0a0a0f;
+    }
+
+    .window {
+      height: 100vh;
+      background: rgba(18, 18, 26, 0.95);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 16px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5), 0 0 0 1px rgba(255, 255, 255, 0.06);
+      animation: spotlightIn 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    @keyframes spotlightIn {
+      from { opacity: 0; transform: scale(0.98) translateY(-8px); }
+      to { opacity: 1; transform: scale(1) translateY(0); }
+    }
+
+    /* ── Search bar ─────────────────────────────────────────────────────── */
+    .search-bar {
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      height: 56px;
+      gap: 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      flex-shrink: 0;
+      -webkit-app-region: drag;
+      border-radius: 14px 14px 0 0;
+    }
+
+    #spotlight-input, .spinner-sm, .search-tools { -webkit-app-region: no-drag; }
+
+    .search-icon { color: #6b7280; flex-shrink: 0; }
+
+    #spotlight-input {
+      flex: 1;
+      background: rgba(129, 140, 248, 0.08);
+      border: 1px solid rgba(129, 140, 248, 0.18);
+      border-radius: 10px;
+      padding: 0.45rem 0.65rem;
+      outline: none;
+      font-size: 1.05rem;
+      font-weight: 400;
+      color: #f3f4f6;
+      caret-color: #818cf8;
+      font-family: inherit;
+      resize: vertical;
+      min-height: 38px;
+      max-height: 90px;
+      line-height: 1.35;
+    }
+
+    #spotlight-input:focus {
+      border-color: rgba(129, 140, 248, 0.45);
+      box-shadow: 0 0 0 2px rgba(129, 140, 248, 0.14);
+    }
+
+    #spotlight-input::placeholder { color: #6b7280; }
+
+    .spinner-sm {
+      width: 14px; height: 14px;
+      border: 2px solid rgba(255, 255, 255, 0.06);
+      border-top-color: #818cf8;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      flex-shrink: 0;
+      display: none;
+    }
+    .spinner-sm.active { display: block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Results ────────────────────────────────────────────────────────── */
+    #results {
+      overflow-y: auto;
+      flex: 1;
+      padding: 4px;
+    }
+
+    #results::-webkit-scrollbar { width: 4px; }
+    #results::-webkit-scrollbar-track { background: transparent; }
+    #results::-webkit-scrollbar-thumb { background: #6b7280; border-radius: 2px; opacity: 0.3; }
+
+    .result-item {
+      display: flex;
+      flex-direction: column;
+      padding: 8px 12px;
+      cursor: pointer;
+      gap: 2px;
+      transition: background 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      border-radius: 8px;
+      margin: 1px 0;
+    }
+
+    .result-item.active,
+    .result-item:hover {
+      background: rgba(129, 140, 248, 0.12);
+    }
+
+    .result-title {
+      font-size: 0.85rem;
+      font-weight: 500;
+      color: #f3f4f6;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .result-snippet {
+      font-size: 0.75rem;
+      color: #9ca3af;
+      line-height: 1.4;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .result-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 2px;
+    }
+
+    .result-type {
+      font-size: 0.65rem;
+      padding: 1px 5px;
+      border-radius: 3px;
+      background: #22222f;
+      color: #9ca3af;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      flex-shrink: 0;
+    }
+
+    .result-path {
+      font-size: 0.68rem;
+      color: #6b7280;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+    }
+
+    .result-score {
+      font-size: 0.65rem;
+      color: #818cf8;
+      flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
+      opacity: 0.7;
+    }
+
+    .empty {
+      padding: 24px 16px;
+      text-align: center;
+      color: #6b7280;
+      font-size: 0.85rem;
+    }
+
+    .search-tools {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .tool-button {
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 6px;
+      padding: 3px 7px;
+      background: #22222f;
+      color: #d1d5db;
+      font: inherit;
+      font-size: 0.68rem;
+      cursor: pointer;
+    }
+
+    .tool-button:disabled { opacity: 0.45; cursor: default; }
+
+    #history-list {
+      max-height: 130px;
+      overflow-y: auto;
+      padding: 4px 10px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      color: #9ca3af;
+      font-size: 0.72rem;
+    }
+
+    .history-entry {
+      display: block;
+      width: 100%;
+      padding: 4px;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      text-align: left;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      cursor: pointer;
+    }
+
+    .history-entry:hover { background: rgba(129, 140, 248, 0.12); }
+
+    #suggestion {
+      padding: 4px 12px;
+      color: #9ca3af;
+      font-size: 0.72rem;
+    }
+
+    #direct-answer {
+      display: none;
+      padding: 5px 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      color: #d1d5db;
+      font-size: 0.72rem;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    #preview {
+      display: none;
+      max-height: 112px;
+      overflow: auto;
+      padding: 7px 12px;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      color: #d1d5db;
+      font-size: 0.72rem;
+      line-height: 1.4;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    #preview-path { color: #818cf8; margin-bottom: 3px; }
+
+    .chat-panel {
+      display: none;
+      flex-direction: column;
+      max-height: 220px;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .chat-panel.visible { display: flex; }
+
+    .chat-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 6px 12px;
+      color: #d1d5db;
+      font-size: 0.75rem;
+    }
+
+    #chat-messages {
+      min-height: 38px;
+      overflow-y: auto;
+      padding: 4px 12px;
+      font-size: 0.72rem;
+    }
+
+    .chat-message { margin: 3px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .chat-message.user { color: #a5b4fc; }
+    .chat-message.assistant { color: #d1d5db; }
+    .chat-message.system { color: #fbbf24; }
+
+    .chat-input-row {
+      display: flex;
+      gap: 6px;
+      padding: 6px 10px 8px;
+    }
+
+    #chat-input {
+      min-width: 0;
+      flex: 1;
+      padding: 5px 7px;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 6px;
+      outline: none;
+      background: #12121a;
+      color: #f3f4f6;
+      font: inherit;
+      font-size: 0.75rem;
+    }
+
+    /* ── Hint bar ───────────────────────────────────────────────────────── */
+    .hint-bar {
+      display: flex;
+      justify-content: space-between;
+      padding: 6px 16px;
+      font-size: 0.68rem;
+      color: #6b7280;
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      flex-shrink: 0;
+    }
+
+    kbd {
+      background: #22222f;
+      border-radius: 3px;
+      padding: 1px 4px;
+      font-family: inherit;
+      font-size: 0.65rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="window">
+    <div class="search-bar">
+      <span class="search-icon">
+        <svg width="18" height="18" viewBox="0 0 20 20" fill="none">
+          <circle cx="9" cy="9" r="5.5" stroke="currentColor" stroke-width="1.7"/>
+          <path d="M13.5 13.5L17 17" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+        </svg>
+      </span>
+      <textarea
+        id="spotlight-input"
+        placeholder="Search your documents… (min 2 chars)"
+        autocomplete="off"
+        spellcheck="false"
+        rows="1"
+        autofocus
+      ></textarea>
+      <div id="spinner" class="spinner-sm"></div>
+    </div>
+
+    <div class="search-tools">
+      <button type="button" class="tool-button" id="history-btn">History</button>
+      <button type="button" class="tool-button" id="within-btn" disabled>Search within results</button>
+      <button type="button" class="tool-button" id="clear-scope-btn" style="display:none;">Clear scope</button>
+      <button type="button" class="tool-button" id="chat-btn" disabled>Chat about result</button>
+      <button type="button" class="tool-button" id="copy-result-btn" disabled>Copy snippet</button>
+      <button type="button" class="tool-button" id="copy-path-btn" disabled>Copy path</button>
+    </div>
+    <div id="history-list" style="display:none;"></div>
+    <div id="suggestion" style="display:none;"></div>
+    <div id="direct-answer"></div>
+    <div id="results"></div>
+    <div id="preview"><div id="preview-path"></div><div id="preview-text"></div></div>
+    <section id="chat-panel" class="chat-panel" aria-label="RAG chat about selected document">
+      <div class="chat-header">
+        <strong id="chat-title">Chat about document</strong>
+        <button type="button" class="tool-button" id="chat-close-btn">Close</button>
+      </div>
+      <div id="chat-messages" aria-live="polite"></div>
+      <form id="chat-form" class="chat-input-row">
+        <input id="chat-input" type="text" placeholder="Ask about this document..." autocomplete="off" />
+        <button type="submit" class="tool-button" id="chat-send-btn">Send</button>
+      </form>
+    </section>
+
+    <div class="hint-bar">
+      <span><kbd>&uarr;&darr;</kbd> navigate &middot; <kbd>&crarr;</kbd> open &middot; <kbd>&#8984;&crarr;</kbd> reveal &middot; <kbd>Esc</kbd> close</span>
+      <span>DocFinder</span>
+    </div>
+  </div>
+
+  <script>
+    const apiBase = window.location.origin;
+    const input   = document.getElementById('spotlight-input');
+    const results = document.getElementById('results');
+    const spinner = document.getElementById('spinner');
+    const historyList = document.getElementById('history-list');
+    const historyButton = document.getElementById('history-btn');
+    const withinButton = document.getElementById('within-btn');
+    const clearScopeButton = document.getElementById('clear-scope-btn');
+    const copyResultButton = document.getElementById('copy-result-btn');
+    const copyPathButton = document.getElementById('copy-path-btn');
+    const chatButton = document.getElementById('chat-btn');
+    const chatPanel = document.getElementById('chat-panel');
+    const chatTitle = document.getElementById('chat-title');
+    const chatMessages = document.getElementById('chat-messages');
+    const chatForm = document.getElementById('chat-form');
+    const chatInput = document.getElementById('chat-input');
+    const chatSendButton = document.getElementById('chat-send-btn');
+    const chatCloseButton = document.getElementById('chat-close-btn');
+    const suggestionBox = document.getElementById('suggestion');
+    const directAnswerBox = document.getElementById('direct-answer');
+    const preview = document.getElementById('preview');
+    const previewPath = document.getElementById('preview-path');
+    const previewText = document.getElementById('preview-text');
+
+    let activeIndex    = -1;
+    let currentResults = [];
+    let searchScopePaths = null;
+    let selectedResult = null;
+    let chatScope = [];
+    let debounceTimer  = null;
+    let requestSerial  = 0;
+
+    function escHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function fileExt(path) {
+      const m = String(path).match(/\.([^.]+)$/);
+      return m ? m[1].toLowerCase() : '';
+    }
+
+    function shortPath(path) {
+      const parts = String(path).split(/[/\\]/);
+      return parts.slice(-3).join('/');
+    }
+
+    function formatSpotBadge(meta) {
+      if (!meta || typeof meta !== 'object') return '';
+      if (meta.timestamp) return `⏱ ${escHtml(meta.timestamp)}`;
+      if (meta.line_start) return `L${meta.line_start}`;
+      if (meta.page) return `p.${meta.page}`;
+      return '';
+    }
+
+    function renderResults(items) {
+      currentResults = items;
+      activeIndex    = -1;
+      withinButton.disabled = !items.length;
+
+      if (!items.length) {
+        results.innerHTML = '<div class="empty">No results found</div>';
+        preview.style.display = 'none';
+        selectedResult = null;
+        copyResultButton.disabled = true;
+        copyPathButton.disabled = true;
+        chatButton.disabled = true;
+        return;
+      }
+
+      results.innerHTML = items.map((r, i) => {
+        const badge = formatSpotBadge(r.metadata);
+        return `
+        <div class="result-item" data-index="${i}" data-path="${escHtml(r.path)}">
+          <div class="result-title">${escHtml(r.title || fileExt(r.path).toUpperCase() + ' document')}</div>
+          <div class="result-snippet">${escHtml(r.text)}</div>
+          <div class="result-meta">
+            <span class="result-type">${escHtml(fileExt(r.path) || 'doc')}</span>
+            ${badge ? `<span class="result-type" style="color:#a5b4fc;">${badge}</span>` : ''}
+            <span class="result-path" title="${escHtml(r.path)}">${escHtml(shortPath(r.path))}</span>
+            <span class="result-score">${Math.round(r.score * 100)}%</span>
+          </div>
+        </div>
+      `;
+      }).join('');
+
+      results.querySelectorAll('.result-item').forEach(el => {
+        const idx = parseInt(el.dataset.index);
+        el.addEventListener('click',      (ev) => openResult(currentResults[idx], ev.metaKey || ev.ctrlKey));
+        el.addEventListener('mouseenter', () => setActive(idx));
+      });
+      if (items.length) setActive(0);
+    }
+
+    function setActive(idx) {
+      activeIndex = Math.max(0, Math.min(idx, currentResults.length - 1));
+      results.querySelectorAll('.result-item').forEach((el, i) => {
+        el.classList.toggle('active', i === activeIndex);
+      });
+      selectedResult = currentResults[activeIndex];
+      previewPath.textContent = selectedResult.path;
+      previewText.textContent = selectedResult.text || '(no snippet available)';
+      preview.style.display = '';
+      copyResultButton.disabled = !selectedResult.text;
+      copyPathButton.disabled = !selectedResult.path;
+      chatButton.disabled = false;
+    }
+
+    async function copyText(text) {
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return;
+        } catch (_err) {
+          // Fall through to the local document copy path.
+        }
+      }
+      const helper = document.createElement('textarea');
+      helper.value = text;
+      helper.style.position = 'fixed';
+      helper.style.opacity = '0';
+      document.body.appendChild(helper);
+      helper.select();
+      const copied = document.execCommand('copy');
+      helper.remove();
+      if (!copied) throw new Error('Clipboard access is unavailable');
+    }
+
+    historyButton.addEventListener('click', async () => {
+      historyList.style.display = historyList.style.display === 'none' ? '' : 'none';
+      if (historyList.style.display === 'none') return;
+      try {
+        const response = await fetch(`${apiBase}/search/history`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || 'Unable to load history');
+        historyList.replaceChildren();
+        if (!data.enabled) {
+          historyList.textContent = 'Enable local search history in Settings to save searches.';
+        } else if (!data.history.length) {
+          historyList.textContent = 'No saved searches yet.';
+        } else {
+          data.history.forEach(item => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'history-entry';
+            button.textContent = item.query;
+            button.addEventListener('click', () => {
+              input.value = item.query;
+              input.focus();
+              historyList.style.display = 'none';
+            });
+            historyList.appendChild(button);
+          });
+        }
+      } catch (error) {
+        historyList.textContent = error.message;
+      }
+    });
+
+    withinButton.addEventListener('click', () => {
+      searchScopePaths = [...new Set(currentResults.map(item => item.path))].slice(0, 500);
+      clearScopeButton.style.display = '';
+    });
+
+    clearScopeButton.addEventListener('click', () => {
+      searchScopePaths = null;
+      clearScopeButton.style.display = 'none';
+    });
+
+    copyResultButton.addEventListener('click', async () => {
+      try {
+        if (!selectedResult?.text) return;
+        await copyText(selectedResult.text);
+        copyResultButton.textContent = 'Copied';
+        setTimeout(() => { copyResultButton.textContent = 'Copy snippet'; }, 1000);
+      } catch (error) {
+        suggestionBox.textContent = error.message;
+        suggestionBox.style.display = '';
+      }
+    });
+
+    copyPathButton.addEventListener('click', async () => {
+      try {
+        if (!selectedResult?.path) return;
+        await copyText(selectedResult.path);
+        copyPathButton.textContent = 'Copied';
+        setTimeout(() => { copyPathButton.textContent = 'Copy path'; }, 1000);
+      } catch (error) {
+        suggestionBox.textContent = error.message;
+        suggestionBox.style.display = '';
+      }
+    });
+
+    function addChatMessage(role, text) {
+      const message = document.createElement('div');
+      message.className = `chat-message ${role}`;
+      message.textContent = text;
+      chatMessages.appendChild(message);
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+      return message;
+    }
+
+    chatButton.addEventListener('click', () => {
+      if (!selectedResult) return;
+      chatTitle.textContent = `Chat · ${selectedResult.title || fileExt(selectedResult.path).toUpperCase()}`;
+      chatScope = currentResults.slice(0, 20).map(item => ({
+        path: item.path,
+        chunk_index: item.chunk_index,
+      }));
+      if (!chatScope.some(hit =>
+        hit.path === selectedResult.path && hit.chunk_index === selectedResult.chunk_index
+      )) {
+        chatScope.unshift({
+          path: selectedResult.path,
+          chunk_index: selectedResult.chunk_index,
+        });
+        chatScope = chatScope.slice(0, 20);
+      }
+      chatMessages.replaceChildren();
+      addChatMessage(
+        'system',
+        'Ask about the current search results. Answers require a matching source excerpt. Enable AI Chat and download a model in Settings if needed.',
+      );
+      chatPanel.classList.add('visible');
+      chatInput.focus();
+    });
+
+    chatCloseButton.addEventListener('click', () => chatPanel.classList.remove('visible'));
+
+    chatForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const question = chatInput.value.trim();
+      if (!question || !selectedResult) return;
+      addChatMessage('user', question);
+      chatInput.value = '';
+      chatInput.disabled = true;
+      chatSendButton.disabled = true;
+      const pending = addChatMessage('system', 'Thinking…');
+      try {
+        const response = await fetch(`${apiBase}/rag/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            question,
+            document_path: selectedResult.path,
+            chunk_index: selectedResult.chunk_index,
+            scope: chatScope,
+          }),
+        });
+        const data = await response.json();
+        pending.remove();
+        if (!response.ok) {
+          addChatMessage('system', data.detail || 'Unable to generate an answer.');
+        } else if (data.answer) {
+          const evidenceText = (data.evidence || []).map(item =>
+            `Evidence: "${item.quote}"\nSource: ${item.title || item.source}` +
+            (item.page ? ` · Page ${item.page}` : '') +
+            (item.line_start ? ` · Line ${item.line_start}` : '')
+          ).join('\n\n');
+          addChatMessage(
+            'assistant',
+            evidenceText ? `${data.answer}\n\n${evidenceText}` : data.answer,
+          );
+        } else {
+          addChatMessage('system', 'The chat service returned an empty answer.');
+        }
+      } catch (error) {
+        pending.remove();
+        addChatMessage('system', `Connection error: ${error.message}`);
+      } finally {
+        chatInput.disabled = false;
+        chatSendButton.disabled = false;
+        chatInput.focus();
+      }
+    });
+
+    async function openResult(itemOrPath, reveal = false) {
+      const isObj = itemOrPath && typeof itemOrPath === 'object';
+      const path  = isObj ? itemOrPath.path : itemOrPath;
+      const meta  = (isObj && itemOrPath.metadata) || {};
+      const payload = {
+        path,
+        reveal: Boolean(reveal),
+        page: meta.page || null,
+        line: meta.line_start || null,
+        start_sec: meta.start_sec !== undefined ? meta.start_sec : null,
+      };
+      try {
+        const response = await fetch(`${apiBase}/open`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) {
+          const data = await response.json();
+          results.insertAdjacentHTML(
+            'afterbegin',
+            `<div class="empty">${escHtml(data.detail || 'Unable to open file')}</div>`,
+          );
+          return;
+        }
+      } catch (error) {
+        results.insertAdjacentHTML(
+          'afterbegin',
+          `<div class="empty">${escHtml(error.message || 'Unable to open file')}</div>`,
+        );
+        return;
+      }
+      hideSpotlight();
+    }
+
+    function hideSpotlight() {
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.spotlight) {
+        window.webkit.messageHandlers.spotlight.postMessage({ action: 'hide' });
+      } else if (window.pywebview) {
+        window.pywebview.api.hide_spotlight();
+      } else {
+        fetch(apiBase + '/gui/spotlight/hide', { method: 'POST' }).catch(() => {});
+      }
+    }
+
+    async function doSearch(query) {
+      const trimmed = query.trim();
+      suggestionBox.replaceChildren();
+      suggestionBox.style.display = 'none';
+      directAnswerBox.replaceChildren();
+      directAnswerBox.style.display = 'none';
+      if (trimmed.length < 2) {
+        results.innerHTML = '';
+        currentResults = [];
+        selectedResult = null;
+        preview.style.display = 'none';
+        withinButton.disabled = true;
+        copyResultButton.disabled = true;
+        copyPathButton.disabled = true;
+        return;
+      }
+      spinner.classList.add('active');
+      const serial = ++requestSerial;
+      try {
+        const res  = await fetch(`${apiBase}/search`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: trimmed,
+            top_k: 10,
+            ...(searchScopePaths ? { paths: searchScopePaths } : {}),
+          }),
+        });
+        const data = await res.json();
+        if (serial !== requestSerial) return;
+        if (res.ok) {
+          const scored = data.results || [];
+          const relevant = scored.filter(r => r.score >= 0.2);
+          renderResults(relevant.length ? relevant : scored);
+          if (data.direct_answer) {
+            const location = data.direct_answer.metadata?.page
+              ? ` · Page ${data.direct_answer.metadata.page}`
+              : (data.direct_answer.metadata?.line_start
+                ? ` · Line ${data.direct_answer.metadata.line_start}` : '');
+            directAnswerBox.textContent =
+              `Direct match: ${data.direct_answer.value}\n` +
+              `${data.direct_answer.title || data.direct_answer.path}${location}\n` +
+              data.direct_answer.excerpt;
+            directAnswerBox.style.display = '';
+          }
+          if (data.suggestion && data.suggestion.toLocaleLowerCase() !== trimmed.toLocaleLowerCase()) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'tool-button';
+            button.textContent = data.suggestion;
+            button.addEventListener('click', () => {
+              input.value = data.suggestion;
+              doSearch(input.value);
+            });
+            suggestionBox.replaceChildren(document.createTextNode('Did you mean '), button, document.createTextNode('?'));
+            suggestionBox.style.display = '';
+          } else {
+            suggestionBox.style.display = 'none';
+          }
+          if (data.query_log_error) {
+            const logError = document.createElement('div');
+            logError.style.color = '#f87171';
+            logError.textContent = data.query_log_error;
+            suggestionBox.appendChild(logError);
+            suggestionBox.style.display = '';
+          }
+        } else {
+          results.innerHTML = `<div class="empty">${escHtml(data.detail || 'Error')}</div>`;
+        }
+      } catch (_) {
+        if (serial === requestSerial) {
+          results.innerHTML = '<div class="empty">Search unavailable \u2014 is DocFinder indexed?</div>';
+        }
+      } finally {
+        spinner.classList.remove('active');
+      }
+    }
+
+    // Debounced search
+    input.addEventListener('input', () => {
+      clearTimeout(debounceTimer);
+      const q = input.value.trim();
+      if (q.length < 2) { results.innerHTML = ''; currentResults = []; return; }
+      debounceTimer = setTimeout(() => doSearch(input.value), 250);
+    });
+
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        doSearch(input.value);
+      }
+    });
+
+    // Keyboard navigation
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') {
+        if (chatPanel.classList.contains('visible')) {
+          chatPanel.classList.remove('visible');
+          return;
+        }
+        hideSpotlight();
+        return;
+      }
+      if (e.target === chatInput && e.key === 'Enter') return;
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) return;
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setActive(activeIndex + 1);
+        results.querySelectorAll('.result-item')[activeIndex]
+          ?.scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setActive(activeIndex - 1);
+        results.querySelectorAll('.result-item')[activeIndex]
+          ?.scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'Enter') {
+        if (activeIndex >= 0 && currentResults[activeIndex]) {
+          openResult(currentResults[activeIndex], e.metaKey || e.ctrlKey);
+        }
+      }
+    });
+
+    // Auto-focus search on load and whenever the window regains focus
+    window.addEventListener('load', () => input.focus());
+    window.addEventListener('focus', () => {
+      setTimeout(() => input.focus(), 30);
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) setTimeout(() => input.focus(), 30);
+    });
+  </script>
+</body>
+</html>

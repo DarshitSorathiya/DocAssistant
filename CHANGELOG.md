@@ -1,0 +1,348 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [2.4.0] - 2026-11-08
+
+### Added
+- **Modular multimodal embeddings (Google EmbeddingGemma 2)** - switched the default embedding engine to `google/embeddinggemma-2` (768-dim shared vector space across 100+ languages) with three selectable modality encoders that share the same index without requiring a re-index when enabled:
+  - **Text, Office & Code (`270M`, always on)** - digital documents, spreadsheets, emails, and source code
+  - **Scanned PDFs & Images (`+170M` Vision module)** - standalone images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, `.tiff`, `.gif`) and image-only/scanned PDF pages rendered via PyMuPDF without external OCR
+  - **Audio & Video Recordings (`+300M` Audio module)** - audio recordings (`.wav`, `.mp3`, `.m4a`, `.flac`, `.ogg`) and video files (`.mp4`, `.mov`, `.mkv`, `.webm`) segmented into overlapping 30-second windows with timestamps (`⏱ M:SS`)
+- **Expanded file format support** - added native paged ingestion for Excel workbooks (`.xlsx`), OpenDocument spreadsheets (`.ods`), comma/tab-separated tables (`.csv`, `.tsv` rendered as Markdown tables), Rich Text (`.rtf`), emails and mailboxes (`.eml`, `.mbox`), structured/config files (`.json`, `.yaml`, `.yml`, `.xml`, `.toml`, `.ini`, `.rst`, `.tex`, `.log`), and 20+ source code extensions (`.py`, `.js`, `.ts`, `.tsx`, `.jsx`, `.rs`, `.go`, `.java`, `.c`, `.cpp`, `.h`, `.hpp`, `.cs`, `.rb`, `.php`, `.swift`, `.kt`, `.sh`, `.sql`)
+- **Hybrid search with exact-word & filename boost** - `SQLiteVectorStore.search()` now combines vector cosine similarity with a lexical boost for exact phrases, identifiers, invoice numbers, error codes, and filenames, plus `code:` query prefix support for code retrieval
+- **Deep-linking & Reveal in Folder** - source code chunks record `line_start` / `line_end` and open directly at `file:line` in VS Code, Cursor, or Zed; search results and Spotlight now display `Page N`, `Lines A–B`, or `⏱ M:SS` badges alongside a **Show in Folder** button (`⌘↩` / `Ctrl+Enter` in Spotlight)
+- **Smart path exclusions & missing-modality scan warnings** - directory scanning automatically skips `node_modules`, `__pycache__`, `venv`, build/dist folders, `.icloud` placeholders, lockfiles, and private keys (`.pem`, `.key`, `id_rsa`); `/index/scan`, the web UI, and the CLI warn when a folder contains images, scanned PDFs, or audio/video files whose modality encoder is disabled
+- **Automatic Ollama modality tag mapping & legacy cache cleanup** - selects `embeddinggemma-2:270m/440m/570m/740m` based on active modalities and adds `cleanup_legacy_models()` (`--cleanup-legacy` CLI flag) to purge old `BAAI/bge-m3` and `all-mpnet-base-v2` caches
+- **In-app auto-update** - the Settings → Updates tab checks GitHub Releases, downloads the right installer for the current OS (`.dmg` / Windows setup / AppImage) with a progress bar, installs it in place and restarts DocFinder automatically; source/pip installs are pointed to the release page
+### Fixed
+- **Spotlight when DocFinder is open** - pressing the global shortcut while the app is frontmost now opens the central in-app search bar instead of doing nothing; the shortcut is read from Settings (default `Option+D`) instead of being hardcoded
+- **Spotlight opens at the exact location** - clicking a result (or pressing Enter) now passes page/line/timestamp to `/open`, so PDFs open at the right page and code at the right line; on macOS Preview is driven to the target page
+- **"Show in Folder" button** - moved to the right of Chat in search results and its hover no longer turns red (red is reserved for destructive actions)
+
+### Changed
+- **Default embedding model** - replaced `BAAI/bge-m3` (1024-dim) with `google/embeddinggemma-2` (768-dim) using asymmetric task prefixes (`title: … | text: …` for documents, `task: search result | query: …` for queries) and safe `bfloat16`/`float32` precision
+- **Spotlight responsiveness** - debounce lowered to 250 ms and minimum query length to 2 characters
+- **Lighter cross-encoder reranking** - skipped reranking when all bi-encoder candidates have very low similarity, reducing latency on non-matching queries
+- **Redesigned documentation website & refreshed branding** - overhauled the MkDocs landing page, interactive feature tabs, keyboard shortcut reference, and updated app icons/logos
+
+## [2.3.0] - 2026-10-05
+
+### Added
+- **Bring your own models (Ollama)** - connect to any local or remote Ollama server and use its models instead of the built-in ones (*Settings → Models & Ollama*): server URL with optional API key and a one-click connection test listing installed models, embedding and chat models chosen independently (changing the embedding model requires a re-index, the chat model applies immediately)
+- **100% privacy mode** - per-indexing-run checkbox that marks documents as strictly local: indexing requires a local embedding model, and AI chat on privacy-marked documents refuses remote LLMs (Ollama on `localhost` is allowed - data never leaves the machine); marked documents show a shield badge and keep the flag across re-indexing
+- **Library filters in the Documents tab** - filter indexed documents by privacy flag, plus **Clean up** (drop index entries whose file no longer exists on disk) and **Refresh** buttons
+
+### Fixed
+- **Offline model loading** - the embedding and reranker models now load directly from the local Hugging Face cache when there is no internet; previously every startup stalled for minutes on connection retries even with all files already cached
+
+## [2.2.0] - 2026-09-10
+
+### Added
+- **Multi-format document indexing** - in addition to PDF, TXT, Markdown and DOCX, DocFinder now indexes legacy Word (.doc), PowerPoint (.pptx, .ppt), OpenDocument (.odt, .odp, .odg), HTML (.html, .htm) and EPUB files. Each format gets page-aware chunking: slides for presentations, 10-paragraph groups for DOCX, heading-based sections for Markdown, spine chapters for EPUB
+- **Embedding-model migration guard** - the index now records which model built it (new `meta` table); on model change the index is wiped once instead of failing with cryptic numpy errors, and search against a stale index raises an explicit "re-index your documents" error
+- **Online documentation** - added a MkDocs site covering installation, usage, supported formats, semantic search, AI chat, architecture, changelog and licensing
+
+### Changed
+- **Embedding model upgraded to BAAI/bge-m3** - multilingual (100+ languages), 8192-token context and higher retrieval quality than all-mpnet-base-v2 (1024-dim vectors). Indexes built with a different embedding model are automatically cleared and re-embedded on the next indexing run
+- **RAG models updated to the Qwen3.5 series** - tiers are now Qwen3.5-9B (16 GB+ RAM), Qwen3.5-4B (8–16 GB) and Qwen3.5-2B (any machine). The GGUF chat templates ship with reasoning ("thinking") disabled by default, keeping RAG answers clean without special handling. Requires `llama-cpp-python>=0.3.34` (first release bundling llama.cpp with Qwen3.5 support)
+
+### Fixed
+- **Startup no longer waits for the embedding model** - the desktop app opens immediately while the model downloads/loads in the background; previously a cold bge-m3 download could exceed the 30-second startup timeout and close the app on first launch
+- **Spotlight panel focus** - the quick-search panel now becomes the key window, orders in front of other apps and focuses the input field automatically when summoned
+- **Global hotkey reliability on macOS** - the event-tap run loop is stopped correctly on reload/disable (previously the main run loop was stopped by mistake) and hotkey toggling is dispatched onto the Cocoa main thread
+- **Folder filters after indexing** - folders indexed in the current session now appear in the search filter list without reloading the page
+- **Spotlight stale results** - late responses from previous queries are discarded so results always match the current input
+- **Folder picker on newer pywebview** - the native dialog now uses the `FileDialog` enum when available
+
+## [2.1.3] - 2026-05-13
+
+### Added
+- **Open button in Library** - Each document row in the Library tab now has an "Open" button to open the file with the system default application
+- **Settings panel reorganization** - Settings tab split into three distinct cards for better UX: Shortcuts, AI Chat (RAG), and Configuration
+
+### Fixed
+- **RAG LLM context window overflow** - `_load_rag_llm()` was hardcoded to `n_ctx=4096` instead of using the model spec's `ctx_size` (8192 for all Qwen2.5 models), causing "Requested tokens exceed context window" errors. The context budget in `rag_chat()` is now dynamically calculated from `_rag_llm.n_ctx - 800`
+- **RAG model not loading on startup** - `loadRagEnabled()` now auto-triggers model load on page load instead of only when the Settings tab is opened, fixing "RAG model not loaded" errors when chatting immediately after search
+- **Safari/WebKit JSON parsing crash** - `sendChat()` now uses `res.text()` + manual `JSON.parse()` with fallback instead of `res.json()`, preventing Safari's cryptic "The string did not match the expected pattern" DOM Exception 12 when the server returns non-JSON responses
+- **RAG LLM error handling** - Added `try/except` around `_rag_llm.chat()` to return a proper JSON 502 error instead of an unhandled exception HTML page
+
+### Changed
+- **LocalLLM** now exposes `n_ctx` as a public attribute for dynamic context sizing
+
+## [2.1.2] - 2026-05-11
+
+### Fixed
+- **macOS indexing performance** - Switched from ONNX/CoreML to PyTorch MPS backend for Apple Silicon, which is significantly faster for embedding generation (from 30+ minutes to seconds for typical workloads)
+- **macOS RAM calculation** - Improved memory detection with `psutil>=5.9.0` for accurate cross-platform RAM detection (previously used `vm_stat` which didn't include all available memory types)
+- **Parallel parsing crash recovery** - Added `BrokenExecutor` fallback to sequential processing when the process pool crashes, preventing complete indexing failures
+
+### Changed
+- **Apple Silicon backend preference** - PyTorch MPS is now the preferred backend for Apple Silicon (previously ONNX with ARM64 quantized model), providing 10-30x faster embedding generation
+- **Adaptive batch sizing** - Embedding batch size now dynamically scales with available RAM across all platforms (4-64 chunks), instead of being hardcoded to 16 on macOS
+- **Backend detection documentation** - Updated docstrings and README to accurately reflect the new backend selection strategy
+- **Test coverage improved** - Expanded test coverage for backend detection and indexing (coverage increased from ~60% to ~65%)
+
+### Performance
+- **Apple Silicon (M-series)**: 10-30x faster indexing through PyTorch MPS backend
+- **High-RAM systems (16GB+)**: Up to 4x larger embedding batches (64 vs 16)
+- **All platforms**: Consistent adaptive batch sizing based on available memory
+
+## [2.1.1] - 2026-05-06
+
+### Fixed
+- **Chat button visibility** - Fixed chat buttons on search results now correctly respect the RAG enable/disable setting; buttons are hidden when RAG is disabled and visible when enabled, both on page load and after toggling the setting
+- **Windows: "Open file" button path handling** - Fixed file path normalization so the "Open" button works correctly on Windows systems; paths with forward slashes (`/`) are now properly converted to Windows backslashes (`\`) via `os.path.normpath()`
+
+### Changed
+- **Test coverage improved** - Expanded test coverage for settings, memory utilities, notifications, text processing, and web app endpoints (coverage increased from ~60% to ~66%)
+
+## [2.1.0] - 2026-04-25
+
+### Added
+- **Cross-encoder reranking** - search results are re-scored by a cross-encoder (`cross-encoder/ms-marco-MiniLM-L-2-v2`) for significantly improved precision; the bi-encoder fetches 3× candidates and the cross-encoder selects the best matches
+- **Parallel document ingestion** - files are parsed in parallel via `ProcessPoolExecutor` (up to 4 workers) when indexing ≥ 4 documents; embedding and storage remain on the main process for thread-safety
+- **Balanced hardware auto-selection for embeddings** - DocFinder now chooses the best available runtime more robustly (e.g. NVIDIA systems without ONNX CUDA provider fall back to PyTorch CUDA instead of CPU)
+- **Balanced adaptive indexing workers** - parallel parser worker count now adapts automatically to CPU/RAM
+- **Runtime diagnostics in settings/system info** - backend/device/GPU/indexing mode are exposed for easier troubleshooting
+- **Hybrid RAG context strategy** - small documents (≤ 20 chunks) are loaded entirely into the RAG context, while large documents use a sliding window around the matched chunk
+- **Table extraction from PDFs** - PyMuPDF `find_tables()` extracts structured tables and converts them to Markdown for better embedding quality
+- New `Reranker` class with lazy model loading (`index/reranker.py`)
+- New storage methods `get_document_chunk_count()` and `get_all_chunks()` for hybrid context
+- Reranker model pre-loaded at startup alongside the embedding model
+- **Search folder filters** - Search tab now includes selectable indexed directory filters (All/None + checkboxes) and applies filtering at query time without re-indexing
+
+### Changed
+- Spotlight panel (`spotlight.html`) redesigned to match the main app's visual style (indigo accent, smaller search bar, rounded result items)
+- Spotlight quick-search input now has rounded corners and less aggressive filtering (min 2 chars, softer score threshold + fallback rendering)
+- ONNX fallback now preserves the best available torch device (`cuda`/`mps`) instead of forcing CPU
+
+
+## [2.0.0] - 2026-03-12
+
+### Added
+- **Local RAG (AI Chat)** - ask questions about your documents using a fully local LLM. No data leaves your machine.
+  - Automatic model selection based on system RAM: Qwen2.5-7B (16 GB+), Qwen2.5-3B (8-16 GB), or Qwen2.5-1.5B (any)
+  - GPU acceleration: Apple Metal on Apple Silicon, CUDA on NVIDIA, CPU fallback
+  - Models downloaded once to `~/.cache/docfinder/models/` via Hugging Face Hub
+  - Chat button appears on search results when RAG is enabled in Settings
+  - Chat panel slides up from bottom-right with full conversation history per session
+- **Page-aware context retrieval** - RAG uses document structure for smarter context:
+  - PDF: real page boundaries
+  - Markdown: heading-based sections
+  - Word (.docx): groups of 10 paragraphs
+  - Plain text: virtual pages of ~3000 characters
+  - Context expands symmetrically to adjacent pages/sections until the token budget is filled
+- **RAG Settings UI** - new "AI Chat (RAG)" section in Settings:
+  - Toggle to enable/disable AI Chat
+  - Hardware detection shows available RAM
+  - Three model cards with size, RAM requirements, and "Recommended" badge
+  - Download progress bar with real-time bytes/percentage tracking
+  - Model status persisted across sessions
+- **Multi-format document support** - DocFinder now indexes PDF, plain text (`.txt`), Markdown (`.md`), and Word (`.docx`) files
+- **Spotlight-style quick-search panel** *(experimental)* - a floating `NSPanel` + `WKWebView` can be summoned via the global hotkey to search documents without switching to the main window
+- New `[rag]` optional dependency group (`pip install docfinder[rag]`)
+- New storage method `get_context_window()` for fixed-window chunk retrieval
+- New storage method `get_context_by_page()` for page-aware chunk retrieval
+- Search results now include `document_id` for downstream RAG integration
+
+### Changed
+- **Redesigned UI theme**
+- `EmbeddingModel.embed()` accepts an optional `batch_size` override for low-RAM scenarios
+- `build_chunks()` now stores `page` number in chunk metadata for all document formats
+- Chunking pipeline uses page-aware `chunk_text_stream_paged()` to preserve page provenance
+
+### New dependencies
+- `llama-cpp-python >= 0.3.0` (optional, in `[rag]` extra)
+
+## [1.2.0] - 2026-03-10
+
+### Fixed
+- **Windows: Fixed crash on startup** - `create_window()` raised `TypeError: unexpected keyword argument 'icon'` on pywebview builds that don't expose the `icon` parameter. The app now checks for parameter support at runtime via `inspect.signature` and falls back gracefully, so the window opens without an icon instead of crashing entirely.
+- **macOS: Fixed dock icon showing Python logo** - When running from source the dock now displays the DocFinder logo instead of the generic Python 3.x icon, via AppKit `NSApplication.setApplicationIconImage_()`.
+
+### Added
+- **Global hotkey** - bring DocFinder to the front from any app with a configurable system-wide keyboard shortcut (default: `⌘+Shift+F` on macOS, `Ctrl+Shift+F` on Windows/Linux); implemented via pynput `GlobalHotKeys`
+- **Settings tab** - new gear-icon tab lets you enable/disable the global hotkey and change the key combination via an interactive capture modal (press the desired keys, confirm)
+- **Native folder picker** - "Browse…" button in the Index tab opens the system file dialog (Finder on macOS, Explorer on Windows) via `window.pywebview.api.pick_folder()`; button is shown only when running inside the desktop app
+
+### Performance 
+- **Indexing 2–4× faster** through several compounding improvements:
+  - `insert_chunks()` now uses `executemany()` for batch SQLite inserts (was one `execute()` per row)
+  - `EmbeddingModel.embed()` uses SentenceTransformer's native batching directly (batch size 32, up from 8); removed the artificial inner mini-batch loop of 4
+  - Chunk batch size per document increased from 32 to 64
+  - Removed `gc.collect()` calls from inside the per-chunk loop; one call per document is sufficient
+  - Removed the artificial 2-files-at-a-time outer loop during indexing
+- **First request instant** - `EmbeddingModel` is now a singleton loaded once at startup; previously a new model instance was created for every `/search`, `/documents`, `/index`, and `/cleanup` request
+
+### UI
+- **Real-time indexing progress** - animated progress bar with file counter and current filename, updated every 600 ms via polling
+- **macOS-native design** - header uses `backdrop-filter: saturate(180%) blur(20px)` for the system frosted-glass effect; improved shadows and depth
+- **⌘K / Ctrl+K** shortcut to jump to search from any tab; search input auto-focused on load
+- **Drag & drop** - drag a folder from Finder/Explorer directly onto the path input in the Index tab
+- Relevance score shown as a **percentage** (e.g. `87%`) instead of a raw float
+- Search result **count** displayed above the results list
+
+## [1.1.2] - 2025-12-15
+
+### Fixed
+- **Windows: Fixed silent crash on startup** - Application would terminate immediately without any visible window
+  - Added `multiprocessing.freeze_support()` required for PyInstaller-bundled apps on Windows
+  - Added `torch.cuda` hidden imports to PyInstaller spec for proper bundling
+  - Added persistent file logging to `%LOCALAPPDATA%\DocFinder\logs\docfinder.log` for debugging
+  - Added native Windows error dialog on startup failures to inform users of issues
+  - Improved startup logging with platform and Python version information
+- **UI: Fixed Search button jumping on hover** - Button no longer moves when hovered
+
+### Added
+- **CI: Smoke tests for all platforms** - Automated verification that bundled apps start correctly
+  - macOS: Tests `.app` bundle launches and stays running
+  - Windows: Tests `.exe` launches and stays running  
+  - Linux: Tests AppImage launches with virtual display (Xvfb)
+  - All tests verify log file creation and check for startup errors
+
+### Changed
+- Improved multiprocessing handling for PyInstaller frozen apps with early child process detection
+
+## [1.1.1] - 2025-12-12
+
+### Added
+- **Improved User Interface**: Enhanced web UI with better design and user experience
+
+### Changed
+- **License changed from MIT to AGPL-3.0** to comply with PyMuPDF licensing requirements
+- **Switched PDF parsing from pypdf to PyMuPDF** for faster and more reliable text extraction and chunking
+
+## [1.0.1] - 2025-11-26
+
+### Fixed
+- Fixed Linux desktop build failing due to disk space issues on CI runner
+- Excluded unnecessary CUDA/GPU libraries from PyInstaller bundle (reduces size ~2GB)
+- Optimized CI workflow with disk cleanup and CPU-only PyTorch for builds
+
+### Notes
+- GPU acceleration (NVIDIA CUDA, AMD ROCm, Apple Metal) still fully supported via system libraries at runtime
+
+## [1.0.0] - 2025-11-24
+
+### Added
+- **🖥️ Native Desktop Application**: Cross-platform GUI using pywebview
+  - macOS: `.app` bundle with DMG installer
+  - Windows: NSIS installer (`.exe`)
+  - Linux: AppImage portable executable
+- **Desktop GUI launcher** (`docfinder-gui` command) for running from source
+- **PyInstaller build configuration** (`DocFinder.spec`) for standalone packaging
+- **Build scripts** for all platforms:
+  - `scripts/build-macos.sh` - Creates `.app` and `.dmg`
+  - `scripts/build-windows.ps1` - Creates NSIS installer
+  - `scripts/build-linux.sh` - Creates AppImage
+- **GitHub Actions workflow** (`build-desktop.yml`) for automated multi-platform builds on release
+- **New `[gui]` optional dependency group** for pywebview
+- macOS app icon (`resources/DocFinder.icns`)
+
+### Changed
+- **Database location for desktop app**: Now stored in `~/Documents/DocFinder/docfinder.db`
+- Improved error messages in web API for missing database
+- Updated README with desktop installation instructions and security bypass guides
+- Updated Makefile with `install-gui`, `build-macos`, `build-windows`, `build-linux` targets
+
+### Fixed
+- Database path resolution for frozen (packaged) applications
+- Config tests updated for dynamic database path behavior
+
+## [0.2.0] - 2025-11-11
+
+### Added
+- **ONNX Runtime Backend Support**: Automatic backend detection with ONNX optimization
+  - 1.5x-1.7x performance improvement on Apple Silicon with quantized ONNX models
+  - Full GPU support: NVIDIA CUDA, AMD ROCm, Apple Silicon (CoreML/MPS)
+  - Automatic platform and GPU detection with intelligent fallback
+  - Configurable backend selection via `EmbeddingConfig`
+- GPU detection functions: `_check_gpu_availability()`, `_check_onnx_providers()`
+- Added `optimum` dependency for ONNX model support
+- **New optional dependency group `[gpu]`** for easy NVIDIA GPU support installation
+- Comprehensive test suite for backend detection and GPU support
+- **Mini-batch processing in embeddings** (4 texts at a time) to reduce memory peaks
+- **Batch file processing during indexing** (2 files at a time) for better memory management
+- **Strategic garbage collection** after each processing batch to prevent memory leaks
+
+### Changed
+- `EmbeddingModel` auto-detects optimal backend based on platform and GPU availability
+- `detect_optimal_backend()` extended with CUDA and ROCm GPU support
+- `EmbeddingConfig` extended with `backend`, `onnx_model_file`, and `device` parameters
+- Improved logging for backend and execution provider information
+- **Reduced default `batch_size` from 16 to 8** in `EmbeddingConfig` for better memory efficiency
+- **Reduced default `chunk_chars` from 1000 to 500** to lower memory footprint during chunking
+- **Reduced default `overlap` from 100 to 50** for more efficient text processing
+- **`IndexPayload` now accepts `List[str]` instead of `List[Path]`** for better web form compatibility
+- Embedding process now uses mini-batching with memory cleanup between batches
+
+### Fixed
+- **Fixed path handling with spaces in directory names** in web interface
+- **Fixed memory exhaustion (OOM) on 16GB RAM systems** during large indexing operations
+- **Fixed web form validation** to properly accept file paths with spaces and special characters
+- Improved memory cleanup to prevent process kills on memory-constrained systems
+
+### Performance
+- Apple Silicon (M4): ~1.7x faster with optimized memory usage
+- **Memory usage optimized**: Reduced peak RAM consumption by ~30% during indexing
+- **Prevented OOM crashes**: Successfully indexes large document collections on 16GB RAM systems
+- NVIDIA GPU: 2-5x faster for large batches
+- AMD GPU: Optimized inference with ROCm provider
+- Intel Mac: ~1.5x faster with ONNX
+
+## Security
+- **🔒 CRITICAL: Fixed path traversal vulnerabilities** ([CWE-22](https://cwe.mitre.org/data/definitions/22.html))
+  - Implemented canonical path validation with `os.path.realpath()`
+  - Added string prefix check to ensure paths are within safe base directory
+  - Restricted file access to user's home directory by default
+  - Added null byte validation to prevent directory traversal attacks
+  - Protection against symlink attacks
+- **Fixed log injection vulnerability** by using safe format strings (`%s`) instead of f-strings with user input
+- All paths now validated before filesystem operations
+- Comprehensive security validation as suggested by GitHub CodeQL
+
+## [0.1.0] - 2025-11-08
+
+### Added
+- Initial release of DocFinder
+- PDF text extraction and chunking with pypdf
+- Local semantic embeddings using sentence-transformers and onnxruntime
+- SQLite-based vector storage with BLOB storage
+- Command-line interface for indexing, searching, and pruning
+- Top-k semantic search using cosine similarity
+- Optional FastAPI web interface for interactive document search
+- Multi-platform support (macOS, Linux, Windows)
+- Python 3.10+ compatibility
+- Comprehensive test suite with pytest
+- CI/CD pipeline with GitHub Actions
+- Code quality checks with ruff
+- Security scanning with CodeQL and dependency review
+- Automated coverage reporting
+
+### Changed
+- Implemented lazy imports for web dependencies to allow basic CLI usage without web extras
+
+### Fixed
+- Fixed import errors when using CLI without web extras installed
+- Fixed linting issues for consistent code style
+- Updated ruff configuration to use non-deprecated settings
+
+[Unreleased]: https://github.com/filippostanghellini/DocFinder/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/filippostanghellini/DocFinder/compare/v2.2.0...v2.3.0
+[2.2.0]: https://github.com/filippostanghellini/DocFinder/compare/v2.1.3...v2.2.0
+[2.1.3]: https://github.com/filippostanghellini/DocFinder/compare/v2.1.2...v2.1.3
+[2.1.2]: https://github.com/filippostanghellini/DocFinder/compare/v2.1.1...v2.1.2
+[2.1.1]: https://github.com/filippostanghellini/DocFinder/compare/v2.1.0...v2.1.1
+[2.1.0]: https://github.com/filippostanghellini/DocFinder/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/filippostanghellini/DocFinder/compare/v1.2.0...v2.0.0
+[1.2.0]: https://github.com/filippostanghellini/DocFinder/compare/v1.1.2...v1.2.0
+[1.1.2]: https://github.com/filippostanghellini/DocFinder/compare/v1.1.1...v1.1.2
+[1.1.1]: https://github.com/filippostanghellini/DocFinder/compare/v1.0.1...v1.1.1
+[1.0.1]: https://github.com/filippostanghellini/DocFinder/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/filippostanghellini/DocFinder/compare/v0.2.0...v1.0.0
+[0.2.0]: https://github.com/filippostanghellini/DocFinder/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/filippostanghellini/DocFinder/releases/tag/v0.1.0
