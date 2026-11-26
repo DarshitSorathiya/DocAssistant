@@ -79,20 +79,19 @@ webview backends.
 
 ### Docker
 
-The CI workflow builds the web-service image on pull requests and publishes it to
-GitHub Container Registry (`ghcr.io/<owner>/docassistant`) on `main` only after all
-CI checks pass. To run it locally:
+The CI workflow builds the web-service image on pull requests and publishes it to Docker Hub
+as `<dockerhub-username>/docassistant` on `main` only after all CI checks pass. Before pushing,
+create a Docker Hub repository named `docassistant` and add these repository Actions secrets:
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (a Docker Hub access token).
 
 ```bash
 docker run --rm -p 127.0.0.1:8000:8000 -v docfinder-data:/data \
-  ghcr.io/darshitsorathiya/docassistant:latest
+  YOUR_DOCKERHUB_USERNAME/docassistant:latest
 ```
 
 The web API has no built-in authentication. Keep the port bound to localhost or place
 the service behind a trusted network/authenticated reverse proxy; do not expose it
 directly to the public internet.
-New GHCR packages are private by default, so authenticate with `docker login ghcr.io`
-before pulling unless you make the package public in GitHub's package settings.
 
 ### Runtime acceleration (auto)
 
