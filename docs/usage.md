@@ -7,6 +7,9 @@ DocFinder provides a **desktop GUI** and a **web interface**.
 Launch the native desktop application:
 
 ```bash
+# Windows, macOS, and Linux
+make setup
+
 make run
 ```
 

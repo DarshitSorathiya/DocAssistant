@@ -74,7 +74,7 @@
     <div class="df-section-head">
       <span class="df-eyebrow">Developer Workflow</span>
       <h2>Run from Source or CLI</h2>
-      <p>Requires Python 3.10+ and <code>make</code>. Setup creates an isolated <code>.venv</code> and installs the desktop, web, and CLI tools.</p>
+      <p>Requires Python 3.10+ and <code>make</code> (GNU Make on Windows). Setup creates an isolated <code>.venv</code> and installs the desktop, web, and CLI tools.</p>
     </div>
 
     <div class="df-bento-2 df-bento-2-centered">
@@ -90,6 +90,7 @@ cd DocFinder
 make setup     # creates .venv and installs [dev,web,gui]
 make run       # launch desktop GUI
 make run-web   # launch web UI at http://127.0.0.1:8000</pre>
+          <p>Works on Windows, macOS, and Linux. Linux setup installs the Qt webview backend; Windows and macOS use their native webview backends. <code>make ubuntu-deps</code> is optional and only for Ubuntu build prerequisites.</p>
         </div>
       </div>
 

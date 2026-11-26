@@ -1,15 +1,27 @@
 .PHONY: ubuntu-deps setup run run-web lint format format-check test check-all install install-gui clean build-linux serve-docs build-docs
 
-PYTHON := python3
 VENV := .venv
-PIP := $(VENV)/bin/pip
-BIN := $(VENV)/bin
+ifeq ($(OS),Windows_NT)
+PYTHON ?= python
+VENV_BIN := $(VENV)/Scripts
+VENV_PYTHON := $(VENV_BIN)/python.exe
+DOCFINDER := $(VENV_BIN)/docfinder.exe
+DOCFINDER_GUI := $(VENV_BIN)/docfinder-gui.exe
+else
+PYTHON ?= python3
+VENV_BIN := $(VENV)/bin
+VENV_PYTHON := $(VENV_BIN)/python
+DOCFINDER := $(VENV_BIN)/docfinder
+DOCFINDER_GUI := $(VENV_BIN)/docfinder-gui
+endif
+PIP := $(VENV_PYTHON) -m pip
 
 # ── Ubuntu System Dependencies ────────────────────────────────────────────────
 
 ubuntu-deps:
 	sudo apt update
-	sudo apt install -y python3 python3-pip python3-venv python3-dev build-essential make git
+	sudo apt install -y python3 python3-pip python3-venv python3-dev build-essential make git \
+		pkg-config
 
 # ── First-time Setup ──────────────────────────────────────────────────────────
 
@@ -27,11 +39,11 @@ setup:
 
 # Launch desktop GUI
 run:
-	$(BIN)/docfinder-gui
+	$(DOCFINDER_GUI)
 
 # Launch web interface
 run-web:
-	$(BIN)/docfinder web
+	$(DOCFINDER) web
 
 # ── Installation ──────────────────────────────────────────────────────────────
 
@@ -46,18 +58,18 @@ install-gui:
 # ── Code Quality ──────────────────────────────────────────────────────────────
 
 lint:
-	$(BIN)/ruff check src/ tests/
+	$(VENV_PYTHON) -m ruff check src/ tests/
 
 format-check:
-	$(BIN)/ruff format --check src/ tests/
+	$(VENV_PYTHON) -m ruff format --check src/ tests/
 
 format:
-	$(BIN)/ruff format src/ tests/
+	$(VENV_PYTHON) -m ruff format src/ tests/
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 
 test:
-	$(BIN)/pytest -v --cov=docfinder --cov-report=term
+	$(VENV_PYTHON) -m pytest -v --cov=docfinder --cov-report=term
 
 check-all: lint format-check test
 	@echo "All checks passed!"
@@ -73,16 +85,13 @@ build-linux:
 
 serve-docs:
 	$(PIP) install -e ".[docs]"
-	$(BIN)/mkdocs serve
+	$(VENV_PYTHON) -m mkdocs serve
 
 build-docs:
 	$(PIP) install -e ".[docs]"
-	$(BIN)/mkdocs build
+	$(VENV_PYTHON) -m mkdocs build
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 
 clean:
-	rm -rf build/ dist/ *.egg-info htmlcov/ .coverage coverage.xml .pytest_cache/
-	rm -rf resources/DocFinder.iconset resources/DocFinder.icns resources/DocFinder.ico
-	find . -type d -name __pycache__ -exec rm -rf {} +
-	find . -type f -name "*.pyc" -delete
+	$(PYTHON) -c "import shutil; from pathlib import Path; paths = ['build', 'dist', 'htmlcov', '.pytest_cache', 'resources/DocFinder.iconset', 'resources/DocFinder.icns', 'resources/DocFinder.ico']; [shutil.rmtree(p) if p.is_dir() else p.unlink() for name in paths for p in [Path(name)] if p.exists()]; [p.unlink() for name in ['.coverage', 'coverage.xml'] for p in [Path(name)] if p.is_file()]; [shutil.rmtree(p) for p in Path('.').rglob('__pycache__') if p.is_dir()]; [p.unlink() for p in Path('.').rglob('*.pyc') if p.is_file()]; [shutil.rmtree(p) for p in Path('.').glob('*.egg-info') if p.is_dir()]"

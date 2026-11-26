@@ -30,6 +30,10 @@ import threading
 import time
 from pathlib import Path
 
+if sys.platform.startswith("linux"):
+    # Avoid Qt's GTK theme plugin, which can abort when GNOME settings schemas are mismatched.
+    os.environ.setdefault("QT_QPA_PLATFORMTHEME", "generic")
+
 # Disable tokenizers parallelism to prevent forking issues with PyInstaller
 # This must be set before any imports of transformers/tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -1013,7 +1017,11 @@ def main() -> None:
                     logger.warning("Could not schedule SpotlightPanel.setup: %s", exc)
 
         logger.info("Starting webview window...")
-        webview.start(private_mode=False, func=_on_webview_started)
+        webview.start(
+            gui="qt" if sys.platform.startswith("linux") else None,
+            private_mode=False,
+            func=_on_webview_started,
+        )
 
         logger.info("DocFinder closed normally.")
 

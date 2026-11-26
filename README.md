@@ -72,6 +72,11 @@ make run     # desktop GUI
 make run-web # web interface at http://127.0.0.1:8000
 ```
 
+The setup, run, test, and cleanup Make targets work on Windows, macOS, and Linux. Linux desktop
+mode uses the Qt webview backend installed by `make setup`; Windows and macOS use native
+webview backends.
+`make ubuntu-deps` is optional and only installs Ubuntu build prerequisites.
+
 ### Runtime acceleration (auto)
 
 DocFinder automatically selects the best available runtime on your machine:
