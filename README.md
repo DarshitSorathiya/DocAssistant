@@ -77,6 +77,23 @@ mode uses the Qt webview backend installed by `make setup`; Windows and macOS us
 webview backends.
 `make ubuntu-deps` is optional and only installs Ubuntu build prerequisites.
 
+### Docker
+
+The CI workflow builds the web-service image on pull requests and publishes it to
+GitHub Container Registry (`ghcr.io/<owner>/docassistant`) on `main` only after all
+CI checks pass. To run it locally:
+
+```bash
+docker run --rm -p 127.0.0.1:8000:8000 -v docfinder-data:/data \
+  ghcr.io/darshitsorathiya/docassistant:latest
+```
+
+The web API has no built-in authentication. Keep the port bound to localhost or place
+the service behind a trusted network/authenticated reverse proxy; do not expose it
+directly to the public internet.
+New GHCR packages are private by default, so authenticate with `docker login ghcr.io`
+before pulling unless you make the package public in GitHub's package settings.
+
 ### Runtime acceleration (auto)
 
 DocFinder automatically selects the best available runtime on your machine:
