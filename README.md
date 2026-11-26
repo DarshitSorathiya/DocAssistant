@@ -62,7 +62,7 @@ chmod +x DocFinder-Linux-x86_64.AppImage && ./DocFinder-Linux-x86_64.AppImage
 
 ## Run from Source
 
-Requires Python 3.10+ and `make`.
+Requires Python 3.10–3.15 and `make`.
 
 ```bash
 git clone https://github.com/filippostanghellini/DocFinder.git

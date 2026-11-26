@@ -74,7 +74,7 @@
     <div class="df-section-head">
       <span class="df-eyebrow">Developer Workflow</span>
       <h2>Run from Source or CLI</h2>
-      <p>Requires Python 3.10+ and <code>make</code> (GNU Make on Windows). Setup creates an isolated <code>.venv</code> and installs the desktop, web, and CLI tools.</p>
+      <p>Requires Python 3.10–3.15 and <code>make</code> (GNU Make on Windows). Setup creates an isolated <code>.venv</code> and installs the desktop, web, and CLI tools.</p>
     </div>
 
     <div class="df-bento-2 df-bento-2-centered">
