@@ -527,7 +527,7 @@ class TestSearch:
             paths=["/tmp/doc_b.pdf"],
         )
 
-        assert [result["path"] for result in results] == ["/tmp/doc_b.pdf"]
+        assert [Path(result["path"]) for result in results] == [Path("/tmp/doc_b.pdf")]
 
     def test_multiline_search_boosts_matching_lines(self, temp_db):
         """Matching multiline text receives a deterministic ranking boost."""
@@ -553,7 +553,7 @@ class TestSearch:
             multiline_query="alpha information\nbeta details",
         )
 
-        assert results[0]["path"] == "/tmp/match.txt"
+        assert Path(results[0]["path"]) == Path("/tmp/match.txt")
 
 
 class TestIndexedDirectories:

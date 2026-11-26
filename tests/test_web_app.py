@@ -178,7 +178,7 @@ class TestSearchEndpoint:
         assert response.status_code == 200
         assert response.json()["direct_answer"] == {
             "value": "APP-2025-01234",
-            "path": "/path/to/application.txt",
+            "path": str(Path("/path/to/application.txt")),
             "title": "Application",
             "excerpt": "Application Number: APP-2025-01234",
             "metadata": {"page": 2},
